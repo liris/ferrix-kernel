@@ -1,0 +1,16 @@
+[package]
+name = "ferrix-kernel"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+font8x8 = { version = "0.3.1", default-features = false }
+uefi = { version = "0.41.0" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

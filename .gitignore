@@ -1,0 +1,5 @@
+/target
+/build
+# VMs assembled locally by `make vm` (VMware writes logs, nvram, uuids here)
+/vmware/*.vmwarevm
+.DS_Store
