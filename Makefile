@@ -19,8 +19,11 @@ VMRUN        := /Applications/VMware\ Fusion.app/Contents/Public/vmrun
 
 all: iso
 
+# e.g. `make run FEATURES=fault-test`
+FEATURES ?=
+
 build:
-	cargo build --release
+	cargo build --release $(if $(FEATURES),--features $(FEATURES))
 
 # FAT image holding EFI/BOOT/BOOTAA64.EFI, wrapped as an El Torito EFI boot entry.
 iso: build

@@ -8,6 +8,10 @@ license = "MIT"
 font8x8 = { version = "0.3.1", default-features = false }
 uefi = { version = "0.41.0" }
 
+[features]
+# Deliberately fault after boot to show the panic screen.
+fault-test = []
+
 [profile.dev]
 panic = "abort"
 

@@ -1,9 +1,17 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod acpi;
 mod arch;
 mod console;
+mod exception;
+mod mm;
 
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::vec::Vec;
 use console::{ACCENT, DIM, ERR, FG, Format, Framebuffer, OK};
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
@@ -99,6 +107,17 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
         usable_pages * 4 / 1024
     );
     ok("M1: kernel is self-hosted");
+
+    init_exceptions();
+    init_memory(mmap);
+    report_gic(info.rsdp);
+    ok("M2: exceptions and memory");
+
+    if cfg!(feature = "fault-test") {
+        println!("[test] reading an unmapped address...");
+        let bad = 0xffff_0000_dead_0000usize as *const u64;
+        let _ = unsafe { bad.read_volatile() };
+    }
     println!();
 
     // Poll the generic timer and redraw an uptime line once per second.
@@ -120,6 +139,83 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
     }
 }
 
+fn init_exceptions() {
+    if arch::current_el() != 1 {
+        panic!("expected EL1, running at EL{}", arch::current_el());
+    }
+    let vbar = exception::init();
+    ok(format_args!("vectors at VBAR_EL1={:#x}", vbar));
+
+    // Round-trip through both handled exception types.
+    unsafe { core::arch::asm!("brk #0x42", clobber_abi("C")) };
+    let ret: u64;
+    unsafe { core::arch::asm!("svc #0x7", inout("x0") 41u64 => ret, clobber_abi("C")) };
+    if ret != 42 {
+        panic!("svc returned {} instead of 42", ret);
+    }
+    ok("brk/svc handled and resumed");
+}
+
+fn init_memory(mmap: &impl MemoryMap) {
+    mm::init(mmap);
+    let (free, usable, bitmap) = mm::pages(|pa| (pa.free_pages(), pa.usable_pages(), pa.bitmap_addr()));
+    println!(
+        "[mm  ] {} MiB free in 4K pages, bitmap at {:#x}",
+        free * mm::PAGE_SIZE >> 20,
+        bitmap
+    );
+
+    // Page allocator: take 16 contiguous pages and give them back.
+    let addr = mm::pages(|pa| pa.alloc(16)).expect("page alloc failed");
+    let during = mm::pages(|pa| pa.free_pages());
+    mm::pages(|pa| pa.free(addr, 16));
+    let after = mm::pages(|pa| pa.free_pages());
+    if during + 16 != usable || after != usable {
+        panic!("page accounting off: {} {} {}", usable, during, after);
+    }
+    println!("[mm  ] alloc 16 pages at {:#x}, freed", addr);
+
+    // Heap: collections work, and freed memory is reused.
+    let v: Vec<u64> = (1..=100_000).collect();
+    let sum: u64 = v.iter().sum();
+    let first = v.as_ptr() as usize;
+    drop(v);
+    let v2: Vec<u64> = Vec::with_capacity(100_000);
+    let reused = v2.as_ptr() as usize == first;
+    drop(v2);
+    let b = Box::new([7u8; 64]);
+    let s = format!("sum={} reused={} box={}", sum, reused, b[63]);
+    println!("[heap] {}", s);
+    println!("[heap] {} KiB taken from pages", mm::HEAP.grown_bytes() >> 10);
+    if sum != 5_000_050_000 || !reused {
+        panic!("heap self-test failed: {}", s);
+    }
+    ok("page allocator and heap");
+}
+
+fn report_gic(rsdp: Option<usize>) {
+    let Some(rsdp) = rsdp else {
+        println!("[gic ] no ACPI, GIC unknown");
+        return;
+    };
+    match acpi::find_gic(rsdp) {
+        Ok(g) => {
+            println!(
+                "[gic ] GICv{} GICD={:#x} cpus={} its={}",
+                g.version,
+                g.gicd.unwrap_or(0),
+                g.cpus,
+                g.its
+            );
+            match g.gicr {
+                Some((base, len)) => println!("[gic ] GICR={:#x} len={:#x}", base, len),
+                None => println!("[gic ] no GICR range in MADT"),
+            }
+        }
+        Err(e) => println!("[gic ] MADT: {}", e),
+    }
+}
+
 fn banner() {
     console::with(|c| c.set_color(ACCENT));
     println!("ferrix-kernel {} (aarch64)", VERSION);
@@ -129,7 +225,7 @@ fn banner() {
     println!();
 }
 
-fn ok(msg: &str) {
+fn ok(msg: impl core::fmt::Display) {
     console::with(|c| c.set_color(OK));
     print!("[ ok ] ");
     console::with(|c| c.set_color(FG));
