@@ -7,6 +7,8 @@ mod acpi;
 mod arch;
 mod console;
 mod exception;
+mod gic;
+mod irq;
 mod mm;
 mod nand;
 
@@ -113,7 +115,7 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
 
     init_exceptions();
     init_memory(mmap);
-    report_gic(info.rsdp);
+    let gic = report_gic(info.rsdp);
     ok("M2: exceptions and memory");
     nand_demo();
 
@@ -122,9 +124,38 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
         let bad = 0xffff_0000_dead_0000usize as *const u64;
         let _ = unsafe { bad.read_volatile() };
     }
-    println!();
 
-    // Poll the generic timer and redraw an uptime line once per second.
+    match gic.as_ref().map(gic::init) {
+        Some(Ok(rd)) => {
+            println!("[gic ] GICv3 up, redistributor at {:#x}", rd);
+            irq::start_timer(freq);
+            ok(format_args!("M3: virtual timer IRQ at {} Hz", irq::TICK_HZ));
+            interrupt_loop()
+        }
+        Some(Err(e)) => println!("[gic ] {}", e),
+        None => println!("[gic ] not found"),
+    }
+    println!("[gic ] falling back to polling the timer");
+    println!();
+    polling_loop(freq)
+}
+
+/// Redraws `line` in the dim colour.
+fn status_line(line: usize, args: core::fmt::Arguments) {
+    console::with(|c| {
+        c.goto_line(line);
+        c.set_color(DIM);
+    });
+    print!("{}", args);
+    console::with(|c| c.set_color(FG));
+}
+
+fn uptime(line: usize, secs: u64) {
+    status_line(line, format_args!("uptime {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60));
+}
+
+/// Without interrupts: spin on the generic timer, redraw once per second.
+fn polling_loop(freq: u64) -> ! {
     let line = console::with(|c| c.row()).unwrap_or(0);
     let start = arch::timer_count();
     let mut last = u64::MAX;
@@ -132,14 +163,61 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
         let secs = (arch::timer_count() - start) / freq.max(1);
         if secs != last {
             last = secs;
-            console::with(|c| {
-                c.goto_line(line);
-                c.set_color(DIM);
-            });
-            print!("uptime {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
-            console::with(|c| c.set_color(FG));
+            uptime(line, secs);
         }
         core::hint::spin_loop();
+    }
+}
+
+/// Timer ticks per half clock period of the NAND counter (0.5 s at 10 Hz).
+const HALF_PERIOD_TICKS: u64 = 5;
+
+/// With interrupts: sleep in `wfi`; on each tick redraw the uptime and drive
+/// the NAND counter's clock from the tick count.
+fn interrupt_loop() -> ! {
+    let mut c = Circuit::new();
+    let (clk, one) = (c.input(), c.input());
+    c.set(one, true);
+    let q = c.counter::<4>(clk, one);
+    c.eval().expect("counter did not settle");
+    println!("[ctr ] 4-bit counter, {} NAND, timer-clocked", c.gate_count());
+    // Reserve a blank spacer, then an uptime row and a counter row. Rows are
+    // taken relative to the cursor, which stays valid if the screen scrolls.
+    println!();
+    println!();
+    let line = console::with(|c| c.row()).unwrap_or(1) - 1;
+    let mut seen = u64::MAX;
+    let mut level = false;
+    let mut edges = 0u64;
+    let mut value = c.get_bits(&q);
+    loop {
+        let t = irq::ticks();
+        if t != seen {
+            seen = t;
+            uptime(line, t / irq::TICK_HZ);
+
+            let next_level = (t / HALF_PERIOD_TICKS) % 2 == 1;
+            if next_level != level {
+                level = next_level;
+                c.set(clk, level);
+                c.eval().expect("counter did not settle");
+                let now = c.get_bits(&q);
+                if level {
+                    edges += 1;
+                    if now != (value + 1) % 16 {
+                        panic!("counter went {} -> {} on a rising edge", value, now);
+                    }
+                } else if now != value {
+                    panic!("counter changed {} -> {} on a falling edge", value, now);
+                }
+                value = now;
+            }
+            status_line(
+                line + 1,
+                format_args!("clk={}  q={:04b} ({:2})  edges={}", level as u8, value, value, edges),
+            );
+        }
+        arch::wait_for_interrupt();
     }
 }
 
@@ -197,10 +275,10 @@ fn init_memory(mmap: &impl MemoryMap) {
     ok("page allocator and heap");
 }
 
-fn report_gic(rsdp: Option<usize>) {
+fn report_gic(rsdp: Option<usize>) -> Option<acpi::GicInfo> {
     let Some(rsdp) = rsdp else {
         println!("[gic ] no ACPI, GIC unknown");
-        return;
+        return None;
     };
     match acpi::find_gic(rsdp) {
         Ok(g) => {
@@ -215,8 +293,12 @@ fn report_gic(rsdp: Option<usize>) {
                 Some((base, len)) => println!("[gic ] GICR={:#x} len={:#x}", base, len),
                 None => println!("[gic ] no GICR range in MADT"),
             }
+            Some(g)
         }
-        Err(e) => println!("[gic ] MADT: {}", e),
+        Err(e) => {
+            println!("[gic ] MADT: {}", e);
+            None
+        }
     }
 }
 

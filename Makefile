@@ -5,7 +5,7 @@ ISO     := $(OUT)/$(NAME).iso
 ESP_IMG := $(OUT)/iso_root/efiboot.img
 EDK2    := $(shell brew --prefix qemu)/share/qemu/edk2-aarch64-code.fd
 
-QEMU := qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M \
+QEMU := qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512M \
 	-bios $(EDK2) -device ramfb \
 	-device qemu-xhci -device usb-kbd \
 	-device virtio-scsi-pci -drive if=none,id=cd,format=raw,media=cdrom,file=$(ISO) \
@@ -48,8 +48,17 @@ vm: iso
 	mkdir -p $(VM_DIR)
 	test -f $(VM_DIR)/$(NAME).vmx || cp $(VMX_TEMPLATE) $(VM_DIR)/$(NAME).vmx
 
+# Always boots the freshly built ISO: a running VM is hard-reset, and a
+# stopped one has any suspended state discarded so it does not resume.
+VMX := $(abspath $(VM_DIR)/$(NAME).vmx)
+
 vm-run: vm
-	$(VMRUN) -T fusion start $(abspath $(VM_DIR)/$(NAME).vmx) gui
+	if $(VMRUN) list | grep -qF "$(VMX)"; then \
+		$(VMRUN) -T fusion reset "$(VMX)" hard; \
+	else \
+		rm -f $(VM_DIR)/*.vmss $(VM_DIR)/*.vmem; \
+		$(VMRUN) -T fusion start "$(VMX)" gui; \
+	fi
 
 clean:
 	cargo clean

@@ -30,6 +30,31 @@ pub fn timer_count() -> u64 {
     read_sysreg!("CNTPCT_EL0")
 }
 
+/// Arms the EL1 virtual timer to fire after `ticks` counter ticks.
+/// Its interrupt is PPI 27 on GICv3 systems.
+pub fn virtual_timer_arm(ticks: u64) {
+    unsafe {
+        asm!(
+            "msr cntv_tval_el0, {t}",
+            "msr cntv_ctl_el0, {on}", // ENABLE=1, IMASK=0
+            "isb",
+            t = in(reg) ticks,
+            on = in(reg) 1u64,
+            options(nomem, nostack),
+        )
+    };
+}
+
+/// Unmasks IRQs at the CPU (PSTATE.I = 0).
+pub fn enable_irqs() {
+    unsafe { asm!("msr daifclr, #2", options(nomem, nostack)) };
+}
+
+/// Sleeps until an interrupt (or other event) arrives.
+pub fn wait_for_interrupt() {
+    unsafe { asm!("wfi", options(nomem, nostack)) };
+}
+
 pub fn implementer_name(midr: u64) -> &'static str {
     match (midr >> 24) & 0xff {
         0x41 => "Arm",

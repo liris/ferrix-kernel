@@ -6,9 +6,8 @@
 //! `handle_exception`. On return the (possibly updated) ELR/SPSR are restored
 //! and execution resumes with `eret`.
 //!
-//! FP/SIMD registers are not saved. That is fine for synchronous exceptions
-//! raised from `asm!` blocks declared with `clobber_abi("C")`, but must be
-//! revisited before asynchronous interrupts are enabled (M3).
+//! FP/SIMD registers (q0-q31, FPCR, FPSR) are saved too: IRQs can arrive in
+//! the middle of any code, and compiled Rust uses SIMD registers freely.
 
 use core::arch::{asm, global_asm};
 
@@ -20,15 +19,18 @@ pub struct TrapFrame {
     pub esr: u64,
     pub far: u64,
     _pad: u64,
+    pub q: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 288);
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 816);
 
 global_asm!(
     r#"
 .macro FERRIX_VECTOR kind
     .balign 0x80
-    sub sp, sp, #288
+    sub sp, sp, #816
     stp x0, x1, [sp, #0]
     mov x1, #\kind
     b ferrix_exception_common
@@ -77,6 +79,26 @@ ferrix_exception_common:
     mrs x2, esr_el1
     mrs x3, far_el1
     stp x2, x3, [sp, #264]
+    stp q0, q1, [sp, #288]
+    stp q2, q3, [sp, #320]
+    stp q4, q5, [sp, #352]
+    stp q6, q7, [sp, #384]
+    stp q8, q9, [sp, #416]
+    stp q10, q11, [sp, #448]
+    stp q12, q13, [sp, #480]
+    stp q14, q15, [sp, #512]
+    stp q16, q17, [sp, #544]
+    stp q18, q19, [sp, #576]
+    stp q20, q21, [sp, #608]
+    stp q22, q23, [sp, #640]
+    stp q24, q25, [sp, #672]
+    stp q26, q27, [sp, #704]
+    stp q28, q29, [sp, #736]
+    stp q30, q31, [sp, #768]
+    mrs x2, fpcr
+    mrs x3, fpsr
+    add x4, sp, #800
+    stp x2, x3, [x4]
 
     mov x0, sp
     bl {handler}
@@ -84,6 +106,26 @@ ferrix_exception_common:
     ldp x2, x3, [sp, #248]
     msr elr_el1, x2
     msr spsr_el1, x3
+    add x4, sp, #800
+    ldp x2, x3, [x4]
+    msr fpcr, x2
+    msr fpsr, x3
+    ldp q0, q1, [sp, #288]
+    ldp q2, q3, [sp, #320]
+    ldp q4, q5, [sp, #352]
+    ldp q6, q7, [sp, #384]
+    ldp q8, q9, [sp, #416]
+    ldp q10, q11, [sp, #448]
+    ldp q12, q13, [sp, #480]
+    ldp q14, q15, [sp, #512]
+    ldp q16, q17, [sp, #544]
+    ldp q18, q19, [sp, #576]
+    ldp q20, q21, [sp, #608]
+    ldp q22, q23, [sp, #640]
+    ldp q24, q25, [sp, #672]
+    ldp q26, q27, [sp, #704]
+    ldp q28, q29, [sp, #736]
+    ldp q30, q31, [sp, #768]
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
@@ -100,7 +142,7 @@ ferrix_exception_common:
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
-    add sp, sp, #288
+    add sp, sp, #816
     eret
 "#,
     handler = sym handle_exception,
@@ -155,6 +197,12 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) {
     let ec = (frame.esr >> 26) & 0x3f;
     let iss = frame.esr & 0x1ff_ffff;
     let is_sync = kind % 4 == 0;
+
+    // IRQ taken while running in the kernel (EL1, either stack pointer).
+    if kind == 1 || kind == 5 {
+        crate::irq::handle();
+        return;
+    }
 
     if is_sync && ec == EC_BRK64 {
         crate::println!("[exc ] brk #{:#x} at {:#x}, resuming", iss & 0xffff, frame.elr);

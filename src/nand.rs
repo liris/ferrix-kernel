@@ -149,6 +149,65 @@ impl Circuit {
         (sum, carry)
     }
 
+    // --- Sequential logic -------------------------------------------------
+    //
+    // Feedback needs wires that are used before the gate driving them exists:
+    // `forward` creates such a wire and `drive` attaches its NAND later.
+
+    pub fn forward(&mut self) -> Wire {
+        self.wire()
+    }
+
+    pub fn drive(&mut self, out: Wire, a: Wire, b: Wire) {
+        self.gates.push(Nand { a, b, out });
+    }
+
+    /// SR latch with active-low inputs, driving `q`. 2 NAND.
+    fn sr_latch_to(&mut self, q: Wire, s_n: Wire, r_n: Wire) {
+        let q_n = self.forward();
+        self.drive(q, s_n, q_n);
+        self.drive(q_n, r_n, q);
+    }
+
+    /// Gated D latch, transparent while `en` is 1, driving `q`. 4 NAND.
+    fn d_latch_to(&mut self, q: Wire, d: Wire, en: Wire) {
+        let s_n = self.nand(d, en);
+        // nand(s_n, en) == nand(!d, en) whenever en is 1, saving a NOT.
+        let r_n = self.nand(s_n, en);
+        self.sr_latch_to(q, s_n, r_n);
+    }
+
+    pub fn d_latch(&mut self, d: Wire, en: Wire) -> Wire {
+        let q = self.forward();
+        self.d_latch_to(q, d, en);
+        q
+    }
+
+    /// Rising-edge master-slave D flip-flop driving `q`. 8 NAND; `clk_n`
+    /// (= !clk) is shared between flip-flops on the same clock.
+    pub fn d_flip_flop_to(&mut self, q: Wire, d: Wire, clk: Wire, clk_n: Wire) {
+        let master = self.d_latch(d, clk_n);
+        self.d_latch_to(q, master, clk);
+    }
+
+    /// Synchronous N-bit binary counter: on every rising edge of `clk` the
+    /// flip-flops load `q + 1`, computed by a half-adder chain whose carry-in
+    /// is `one` (a wire held at 1). Returns the little-endian outputs.
+    pub fn counter<const N: usize>(&mut self, clk: Wire, one: Wire) -> [Wire; N] {
+        let clk_n = self.not(clk);
+        let q: [Wire; N] = core::array::from_fn(|_| self.forward());
+        let mut carry = one;
+        let next: [Wire; N] = core::array::from_fn(|i| {
+            let (s, c) = self.half_adder(q[i], carry);
+            carry = c;
+            s
+        });
+        for i in 0..N {
+            self.d_flip_flop_to(q[i], next[i], clk, clk_n);
+        }
+        q
+    }
+
     // --- Multi-bit helpers ------------------------------------------------
 
     pub fn inputs<const N: usize>(&mut self) -> [Wire; N] {
