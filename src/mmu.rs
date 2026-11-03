@@ -14,18 +14,32 @@
 //! Once active, the tables stay owned by this module, and `map_live` can add
 //! regions found later (PCIe config space and BARs). Only invalid entries are
 //! filled in then, so no TLB entry can be stale and no invalidation is needed.
+//!
+//! User programs (M7) each get an `AddressSpace`: a root table of their own
+//! whose entries are copies of the kernel's, so everything below the root is
+//! shared, plus one entry of their own for `USER_BASE..USER_END`. Kernel
+//! mappings are EL1-only and global; user mappings are not global and are
+//! tagged with the space's ASID, so switching TTBR0 between tasks needs no
+//! TLB invalidation.
 
 use crate::mm::{self, PAGE_SIZE};
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const ENTRIES: usize = 512;
 
 const DESC_VALID: u64 = 1 << 0;
 /// Bit 1: "table" at levels 0-2, "page" at level 3. Clear at 0-2 = block.
 const DESC_TABLE_OR_PAGE: u64 = 1 << 1;
+/// AP[1]: EL0 may access it too.
+const DESC_AP_EL0: u64 = 1 << 6;
+/// AP[2]: read-only (at every level that may access it).
+const DESC_AP_RO: u64 = 1 << 7;
 const DESC_AF: u64 = 1 << 10;
+/// Not global: the TLB entry belongs to one ASID.
+const DESC_NG: u64 = 1 << 11;
 const DESC_SH_INNER: u64 = 3 << 8;
 const DESC_PXN: u64 = 1 << 53;
 const DESC_UXN: u64 = 1 << 54;
@@ -50,7 +64,16 @@ pub enum Kind {
     Device,
     /// Normal non-cacheable memory (framebuffer).
     Uncached,
+    /// User program code: EL0 may read and execute it, nobody may write.
+    UserCode,
+    /// User read-only data.
+    UserRo,
+    /// User data and stack: EL0 may read and write, nobody may execute.
+    UserData,
 }
+
+const KINDS: usize = 7;
+const USER: u64 = ATTR_NORMAL | DESC_SH_INNER | DESC_AF | DESC_AP_EL0 | DESC_NG | DESC_PXN;
 
 impl Kind {
     fn attrs(self) -> u64 {
@@ -59,6 +82,9 @@ impl Kind {
             Kind::Code => ATTR_NORMAL | DESC_SH_INNER | DESC_AF | DESC_UXN,
             Kind::Device => ATTR_DEVICE | DESC_AF | DESC_PXN | DESC_UXN,
             Kind::Uncached => ATTR_NC | DESC_SH_INNER | DESC_AF | DESC_PXN | DESC_UXN,
+            Kind::UserCode => USER | DESC_AP_RO,
+            Kind::UserRo => USER | DESC_AP_RO | DESC_UXN,
+            Kind::UserData => USER | DESC_UXN,
         }
     }
 }
@@ -68,8 +94,8 @@ pub struct Stats {
     pub tables: usize,
     pub blocks: usize,
     pub pages: usize,
-    /// Bytes mapped per `Kind`: data, code, device, uncached.
-    pub bytes: [u64; 4],
+    /// Bytes mapped per `Kind`, indexed by `Kind as usize`.
+    pub bytes: [u64; KINDS],
 }
 
 pub struct Mapper {
@@ -82,6 +108,42 @@ fn new_table(stats: &mut Stats) -> *mut u64 {
     unsafe { ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE) };
     stats.tables += 1;
     addr as *mut u64
+}
+
+/// Maps virtual `[start, end)` below `table` to physical `start + delta`
+/// onwards; returns the bytes newly mapped.
+fn map_level(stats: &mut Stats, table: *mut u64, level: usize, start: u64, end: u64, delta: u64, attrs: u64) -> u64 {
+    let shift = 39 - 9 * level;
+    let size = 1u64 << shift;
+    let mut mapped = 0;
+    let mut addr = start;
+    while addr < end {
+        let index = (addr >> shift) as usize % ENTRIES;
+        let chunk_end = ((addr & !(size - 1)) + size).min(end);
+        let entry = unsafe { &mut *table.add(index) };
+
+        if *entry & DESC_VALID == 0 {
+            if level == 3 {
+                *entry = addr.wrapping_add(delta) | attrs | DESC_TABLE_OR_PAGE | DESC_VALID;
+                stats.pages += 1;
+                mapped += size;
+            } else if level >= 1 && addr % size == 0 && delta % size == 0 && chunk_end - addr == size {
+                *entry = addr.wrapping_add(delta) | attrs | DESC_VALID;
+                stats.blocks += 1;
+                mapped += size;
+            } else {
+                let next = new_table(stats);
+                *entry = next as u64 | DESC_TABLE_OR_PAGE | DESC_VALID;
+                mapped += map_level(stats, next, level + 1, addr, chunk_end, delta, attrs);
+            }
+        } else if level < 3 && *entry & DESC_TABLE_OR_PAGE != 0 {
+            let next = (*entry & DESC_ADDR) as *mut u64;
+            mapped += map_level(stats, next, level + 1, addr, chunk_end, delta, attrs);
+        }
+        // Otherwise a block or page already covers it: first mapping wins.
+        addr = chunk_end;
+    }
+    mapped
 }
 
 impl Mapper {
@@ -105,43 +167,8 @@ impl Mapper {
         if start >= end {
             return;
         }
-        let mapped = Self::map_level(&mut self.stats, self.root, 0, start, end, kind.attrs());
+        let mapped = map_level(&mut self.stats, self.root, 0, start, end, 0, kind.attrs());
         self.stats.bytes[kind as usize] += mapped;
-    }
-
-    /// Maps `[start, end)` below `table`; returns the bytes newly mapped.
-    fn map_level(stats: &mut Stats, table: *mut u64, level: usize, start: u64, end: u64, attrs: u64) -> u64 {
-        let shift = 39 - 9 * level;
-        let size = 1u64 << shift;
-        let mut mapped = 0;
-        let mut addr = start;
-        while addr < end {
-            let index = (addr >> shift) as usize % ENTRIES;
-            let chunk_end = ((addr & !(size - 1)) + size).min(end);
-            let entry = unsafe { &mut *table.add(index) };
-
-            if *entry & DESC_VALID == 0 {
-                if level == 3 {
-                    *entry = addr | attrs | DESC_TABLE_OR_PAGE | DESC_VALID;
-                    stats.pages += 1;
-                    mapped += size;
-                } else if level >= 1 && addr % size == 0 && chunk_end - addr == size {
-                    *entry = addr | attrs | DESC_VALID;
-                    stats.blocks += 1;
-                    mapped += size;
-                } else {
-                    let next = new_table(stats);
-                    *entry = next as u64 | DESC_TABLE_OR_PAGE | DESC_VALID;
-                    mapped += Self::map_level(stats, next, level + 1, addr, chunk_end, attrs);
-                }
-            } else if level < 3 && *entry & DESC_TABLE_OR_PAGE != 0 {
-                let next = (*entry & DESC_ADDR) as *mut u64;
-                mapped += Self::map_level(stats, next, level + 1, addr, chunk_end, attrs);
-            }
-            // Otherwise a block or page already covers it: first mapping wins.
-            addr = chunk_end;
-        }
-        mapped
     }
 
     /// Switches TTBR0_EL1 to these tables and keeps them for `map_live`.
@@ -198,6 +225,79 @@ pub fn map_live(start: u64, len: u64, kind: Kind) {
         // The new entries must be visible to the walker before any access.
         unsafe { asm!("dsb ishst", "isb", options(nostack)) };
     });
+}
+
+/// User address range: level 0 entry 128 (64 TiB, 512 GiB long), far above
+/// anything the kernel's identity map reaches. User programs link here.
+pub const USER_BASE: u64 = 0x4000_0000_0000;
+pub const USER_END: u64 = USER_BASE + (1 << 39);
+
+/// ASID 0 is the kernel's; user spaces count up from 1, never reused.
+static NEXT_ASID: AtomicU64 = AtomicU64::new(1);
+
+/// A user program's address space: the kernel's mappings (EL1-only) plus its
+/// own pages in the user range.
+pub struct AddressSpace {
+    root: *mut u64,
+    asid: u64,
+}
+
+impl AddressSpace {
+    /// Shares the kernel's tables as they are now. The kernel must not map
+    /// new level 0 ranges afterwards (all of its mappings sit in entry 0).
+    pub fn new() -> Self {
+        let kernel = kernel_ttbr() as *const u64;
+        let root = new_table(&mut Stats::default());
+        let user = (USER_BASE >> 39) as usize;
+        unsafe {
+            ptr::copy_nonoverlapping(kernel, root, ENTRIES);
+            assert!(*root.add(user) & DESC_VALID == 0, "kernel maps the user range");
+        }
+        let asid = NEXT_ASID.fetch_add(1, Ordering::Relaxed);
+        assert!(asid < 256, "out of ASIDs");
+        Self { root, asid }
+    }
+
+    /// Maps user pages `[va, va + len)` to physical `pa` onwards.
+    pub fn map(&mut self, va: u64, pa: u64, len: u64, kind: Kind) {
+        let page = PAGE_SIZE as u64;
+        assert!(va % page == 0 && pa % page == 0, "unaligned user mapping");
+        assert!(va >= USER_BASE && va + len <= USER_END, "{:#x} is outside the user range", va);
+        assert!(matches!(kind, Kind::UserCode | Kind::UserRo | Kind::UserData));
+        let end = (va + len).next_multiple_of(page);
+        map_level(&mut Stats::default(), self.root, 0, va, end, pa.wrapping_sub(va), kind.attrs());
+    }
+
+    /// TTBR0_EL1 value selecting this space.
+    pub fn ttbr(&self) -> u64 {
+        self.root as u64 | self.asid << 48
+    }
+}
+
+/// TTBR0_EL1 value for the kernel's own tables (ASID 0).
+pub fn kernel_ttbr() -> u64 {
+    crate::arch::without_irqs(|| unsafe { (*ACTIVE.0.get()).as_ref() }.expect("page tables not active").root as u64)
+}
+
+/// Switches to another address space. Called on task switches.
+pub fn set_ttbr0(ttbr: u64) {
+    unsafe { asm!("msr ttbr0_el1, {}", "isb", in(reg) ttbr, options(nostack)) };
+}
+
+/// Whether EL0 may read the byte at `va` in the current address space.
+pub fn user_readable(va: u64) -> bool {
+    let par: u64;
+    unsafe {
+        asm!(
+            "at s1e0r, {va}",
+            "isb",
+            "mrs {par}, par_el1",
+            va = in(reg) va,
+            par = out(reg) par,
+            options(nostack),
+        )
+    };
+    par & 1 == 0
 }
 
 fn read_sysreg_mmfr0() -> u64 {

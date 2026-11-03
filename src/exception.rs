@@ -9,6 +9,11 @@
 //!
 //! FP/SIMD registers (q0-q31, FPCR, FPSR) are saved too: IRQs can arrive in
 //! the middle of any code, and compiled Rust uses SIMD registers freely.
+//!
+//! Exceptions from EL0 (M7) arrive on the user task's kernel stack (SP_EL1)
+//! and save SP_EL0 in the frame as well. An `svc` from EL0 is a system call;
+//! any other synchronous exception from EL0 is the program's fault and ends
+//! that task only.
 
 use core::arch::{asm, global_asm};
 
@@ -19,7 +24,8 @@ pub struct TrapFrame {
     pub spsr: u64,
     pub esr: u64,
     pub far: u64,
-    _pad: u64,
+    /// The EL0 stack pointer of a user task (unused by kernel tasks).
+    pub sp_el0: u64,
     pub q: [u128; 32],
     pub fpcr: u64,
     pub fpsr: u64,
@@ -80,6 +86,8 @@ ferrix_exception_common:
     mrs x2, esr_el1
     mrs x3, far_el1
     stp x2, x3, [sp, #264]
+    mrs x2, sp_el0
+    str x2, [sp, #280]
     stp q0, q1, [sp, #288]
     stp q2, q3, [sp, #320]
     stp q4, q5, [sp, #352]
@@ -108,6 +116,8 @@ ferrix_exception_common:
     ldp x2, x3, [sp, #248]
     msr elr_el1, x2
     msr spsr_el1, x3
+    ldr x2, [sp, #280]
+    msr sp_el0, x2
     add x4, sp, #800
     ldp x2, x3, [x4]
     msr fpcr, x2
@@ -168,10 +178,14 @@ pub fn init() -> u64 {
 const KIND_NAMES: [&str; 4] = ["sync", "irq", "fiq", "serror"];
 const ORIGIN_NAMES: [&str; 4] = ["EL1/SP0", "EL1/SPx", "EL0/A64", "EL0/A32"];
 
+/// Vector numbers of exceptions from AArch64 EL0.
+const KIND_EL0_SYNC: u64 = 8;
+const KIND_EL0_IRQ: u64 = 9;
+
 const EC_SVC64: u64 = 0x15;
 const EC_BRK64: u64 = 0x3c;
 
-fn ec_name(ec: u64) -> &'static str {
+pub fn ec_name(ec: u64) -> &'static str {
     match ec {
         0x00 => "unknown reason",
         0x01 => "WFI/WFE trapped",
@@ -200,10 +214,14 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) -> *mut TrapFra
     let iss = frame.esr & 0x1ff_ffff;
     let is_sync = kind % 4 == 0;
 
-    // IRQ taken while running in the kernel (EL1, either stack pointer).
-    if kind == 1 || kind == 5 {
+    // IRQ taken in the kernel (EL1, either stack pointer) or in a user task.
+    if kind == 1 || kind == 5 || kind == KIND_EL0_IRQ {
         let ticked = crate::irq::handle();
         return if ticked { crate::task::switch(frame, true) } else { frame };
+    }
+
+    if kind == KIND_EL0_SYNC {
+        return if ec == EC_SVC64 { crate::user::syscall(frame) } else { crate::user::fault(frame, ec) };
     }
 
     if is_sync && ec == EC_BRK64 {

@@ -1,0 +1,15 @@
+[package]
+name = "ferrix-user"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+strip = true

@@ -45,6 +45,36 @@ pub fn virtual_timer_arm(ticks: u64) {
     };
 }
 
+/// Lets EL0 use FP/SIMD without trapping (CPACR_EL1.FPEN = 0b11); user
+/// programs compiled from Rust use SIMD registers like the kernel does.
+pub fn allow_fp_at_el0() {
+    let cpacr = read_sysreg!("CPACR_EL1");
+    unsafe { asm!("msr cpacr_el1, {}", "isb", in(reg) cpacr | 0b11 << 20, options(nostack)) };
+}
+
+/// Makes code just written through the data cache visible to instruction
+/// fetch: clean the lines to the point of unification, then invalidate the
+/// instruction cache.
+pub fn sync_icache(addr: usize, len: usize) {
+    // CTR_EL0.DminLine: log2 of the smallest data cache line, in words.
+    let line = 4 << ((read_sysreg!("CTR_EL0") >> 16) & 0xf);
+    let mut at = addr & !(line - 1);
+    while at < addr + len {
+        unsafe { asm!("dc cvau, {}", in(reg) at, options(nostack)) };
+        at += line;
+    }
+    unsafe { asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack)) };
+}
+
+/// Reads a byte with EL0's permissions (`ldtrb`). This works whether or not
+/// PAN is on, which forbids plain EL1 accesses to user memory; VMware's
+/// firmware leaves it on. The address must be mapped for EL0.
+pub fn read_user_byte(addr: u64) -> u8 {
+    let v: u32;
+    unsafe { asm!("ldtrb {v:w}, [{a}]", a = in(reg) addr, v = out(reg) v, options(nostack, readonly)) };
+    v as u8
+}
+
 /// Unmasks IRQs at the CPU (PSTATE.I = 0).
 pub fn enable_irqs() {
     unsafe { asm!("msr daifclr, #2", options(nomem, nostack)) };

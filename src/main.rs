@@ -17,6 +17,7 @@ mod nand;
 mod pci;
 mod task;
 mod usb;
+mod user;
 mod xhci;
 
 use alloc::boxed::Box;
@@ -141,7 +142,8 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
             ok(format_args!("M3: virtual timer IRQ at {} Hz", irq::TICK_HZ));
             start_tasks();
             let keyboard = init_usb(info.rsdp);
-            interrupt_loop(keyboard)
+            let programs = init_user();
+            interrupt_loop(keyboard, programs)
         }
         Some(Err(e)) => println!("[gic ] {}", e),
         None => println!("[gic ] not found"),
@@ -299,7 +301,8 @@ fn task_status(line: usize) {
     let (tasks, switches) = task::snapshot();
     let total = tasks.iter().map(|t| t.ticks).sum::<u64>().max(1);
     let mut cpu = String::from("cpu%");
-    for t in &tasks {
+    // Tasks under 1% are left out: with user programs not all names fit.
+    for t in tasks.iter().filter(|t| t.ticks * 100 / total > 0) {
         cpu += &format!(" {} {}", t.name, t.ticks * 100 / total);
     }
     status_line(line, format_args!("{}", cpu));
@@ -317,6 +320,21 @@ fn task_status(line: usize) {
 
 /// Ticks between redraws of the task lines (10 per second).
 const TASK_REDRAW_TICKS: u64 = irq::TICK_HZ / 10;
+
+/// Loads the user programs and starts them at EL0. Returns how many run.
+fn init_user() -> usize {
+    match user::start() {
+        Ok(n) => {
+            println!("[user] {} programs at EL0, {} KiB ELF", n, user::elf_size() >> 10);
+            ok(format_args!("M7: user space, {} address spaces", n));
+            n
+        }
+        Err(e) => {
+            println!("[user] {}", e);
+            0
+        }
+    }
+}
 
 /// The key help line, or why there is no keyboard; with the count of
 /// reports lost to USB errors, if any.
@@ -336,22 +354,24 @@ fn help_status(line: usize, keyboard: bool) {
 /// The `main` task: sleep a tick at a time; redraw the uptime and task lines,
 /// clock the NAND counter from the tick count, and feed typed keys to the
 /// NAND lab.
-fn interrupt_loop(keyboard: bool) -> ! {
+fn interrupt_loop(keyboard: bool, programs: usize) -> ! {
     let mut lab = lab::Lab::new();
     println!("[lab ] counter {} NAND, adder {} NAND", lab.counter_gates(), lab.adder_gates());
     // Reserve a blank spacer, then rows for uptime, counter, adder, two task
-    // lines and key help. Rows are taken relative to the cursor, which stays
-    // valid if the screen scrolls.
-    for _ in 0..6 {
+    // lines, one per user program and key help. Rows are taken relative to
+    // the cursor, which stays valid if the screen scrolls.
+    let rows = 6 + programs;
+    for _ in 0..rows {
         println!();
     }
-    let line = console::with(|c| c.row()).unwrap_or(5) - 5;
+    let line = console::with(|c| c.row()).unwrap_or(rows - 1) + 1 - rows;
+    let help = line + rows - 1;
     let mut seen = u64::MAX;
     let mut drawn = u64::MAX;
     let mut errors = keyboard::errors();
     status_line(line + 1, format_args!("{}", lab.counter_line()));
     status_line(line + 2, format_args!("{}", lab.adder_line()));
-    help_status(line + 5, keyboard);
+    help_status(help, keyboard);
     loop {
         while let Some(ch) = keyboard::read() {
             let changed = lab.key(ch);
@@ -364,7 +384,7 @@ fn interrupt_loop(keyboard: bool) -> ! {
         }
         if keyboard::errors() != errors {
             errors = keyboard::errors();
-            help_status(line + 5, keyboard);
+            help_status(help, keyboard);
         }
 
         let t = irq::ticks();
@@ -374,6 +394,9 @@ fn interrupt_loop(keyboard: bool) -> ! {
                 drawn = t / TASK_REDRAW_TICKS;
                 uptime(line, t / irq::TICK_HZ);
                 task_status(line + 3);
+                for (i, (name, text)) in user::lines().iter().enumerate() {
+                    status_line(line + 5 + i, format_args!("{} {}", name, text));
+                }
             }
             if lab.timer_clock((t / HALF_PERIOD_TICKS) % 2 == 1) {
                 status_line(line + 1, format_args!("{}", lab.counter_line()));
