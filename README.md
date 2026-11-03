@@ -7,9 +7,9 @@ A tiny AArch64 kernel written in Rust, booting from UEFI on VMware Fusion (Apple
 It starts as a UEFI application, collects the framebuffer, memory map and ACPI pointer, calls
 `ExitBootServices`, and then runs on its own code only: exception vectors, a page allocator and
 heap, its own page tables, GICv3 timer interrupts, preemptive round-robin tasks, a USB keyboard
-through its own xHCI driver, and user programs at EL0 in their own address spaces. Alongside, a
-circuit simulator whose only primitive is NAND builds adders and a counter, which can be driven
-from the keyboard.
+through its own xHCI driver, and user programs at EL0 in their own address spaces that can only use
+the capabilities they were given. Alongside, a circuit simulator whose only primitive is NAND
+builds adders and a counter, which can be driven from the keyboard.
 
 Excerpt of a boot on VMware Fusion:
 
@@ -30,18 +30,21 @@ ferrix-kernel 0.1.0 (aarch64)
 [pci ] 01:00.0 xHCI 15ad:077a
 [usb ] port 6 full 0e0f:0006 keyboard
 [ ok ] M5: USB keyboard ready
-[user] 3 programs at EL0, 16 KiB ELF
-[ ok ] M7: user space, 3 address spaces
+[user] 5 programs at EL0, 16 KiB ELF
+[ ok ] M7: user space, 5 address spaces
+[ ok ] M8: 7 capabilities, 1 channel
 [lab ] counter 53 NAND, adder 36 NAND
 
-uptime 00:00:41
-ctr clk=0 q=1000 ( 8) edges=41 auto
+uptime 00:04:12
+ctr clk=0 q=1011 (11) edges=252 auto
 add a=0011 b=0101 c=0 -> 01000 (3+5+0=8)
 cpu% spin 25 nand 25 fpu 25 u2 24
-spin 4470M  nand 223950  fpu 21182k  sw 6500
-u1 count n=340 &n=0x400000003000
-u2 spin  n=3257M &n=0x400000003000
-u3 killed: read 0x9bdd5438 no permission
+spin 26309M  nand 1627404  fpu 125926k  sw 43357
+u1 count n=2101 &n=0x400000003000
+u2 spin  n=19561M &n=0x400000003000
+u3 sink  2101 msgs, last n=2101
+u4 forge 2024/2024 other slots denied
+u5 killed: read 0x9bdd5348 no permission
 keys 1-4:a 5-8:b c:carry spc:clk m:mode
 ```
 

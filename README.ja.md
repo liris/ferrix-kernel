@@ -4,7 +4,7 @@
 
 Rust で書いた小さな AArch64 カーネルです。UEFI から起動し、VMware Fusion（Apple Silicon）と QEMU で動きます。
 
-UEFI アプリとして起動してフレームバッファ・メモリマップ・ACPI のポインタを集め、`ExitBootServices` を呼んだあとは自前のコードだけで動きます。例外ベクタ、ページアロケータとヒープ、自前のページテーブル、GICv3 のタイマー割り込み、プリエンプティブなラウンドロビンのタスク、自前の xHCI ドライバによる USB キーボード入力、専用のアドレス空間で EL0 で動くユーザープログラムを備えています。あわせて、NAND だけを部品とする回路シミュレータで加算器とカウンタを組み、キーボードから操作できます。
+UEFI アプリとして起動してフレームバッファ・メモリマップ・ACPI のポインタを集め、`ExitBootServices` を呼んだあとは自前のコードだけで動きます。例外ベクタ、ページアロケータとヒープ、自前のページテーブル、GICv3 のタイマー割り込み、プリエンプティブなラウンドロビンのタスク、自前の xHCI ドライバによる USB キーボード入力、専用のアドレス空間で EL0 で動き、渡された capability しか使えないユーザープログラムを備えています。あわせて、NAND だけを部品とする回路シミュレータで加算器とカウンタを組み、キーボードから操作できます。
 
 VMware Fusion での起動画面（抜粋）:
 
@@ -25,18 +25,21 @@ ferrix-kernel 0.1.0 (aarch64)
 [pci ] 01:00.0 xHCI 15ad:077a
 [usb ] port 6 full 0e0f:0006 keyboard
 [ ok ] M5: USB keyboard ready
-[user] 3 programs at EL0, 16 KiB ELF
-[ ok ] M7: user space, 3 address spaces
+[user] 5 programs at EL0, 16 KiB ELF
+[ ok ] M7: user space, 5 address spaces
+[ ok ] M8: 7 capabilities, 1 channel
 [lab ] counter 53 NAND, adder 36 NAND
 
-uptime 00:00:41
-ctr clk=0 q=1000 ( 8) edges=41 auto
+uptime 00:04:12
+ctr clk=0 q=1011 (11) edges=252 auto
 add a=0011 b=0101 c=0 -> 01000 (3+5+0=8)
 cpu% spin 25 nand 25 fpu 25 u2 24
-spin 4470M  nand 223950  fpu 21182k  sw 6500
-u1 count n=340 &n=0x400000003000
-u2 spin  n=3257M &n=0x400000003000
-u3 killed: read 0x9bdd5438 no permission
+spin 26309M  nand 1627404  fpu 125926k  sw 43357
+u1 count n=2101 &n=0x400000003000
+u2 spin  n=19561M &n=0x400000003000
+u3 sink  2101 msgs, last n=2101
+u4 forge 2024/2024 other slots denied
+u5 killed: read 0x9bdd5348 no permission
 keys 1-4:a 5-8:b c:carry spc:clk m:mode
 ```
 

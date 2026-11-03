@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod acpi;
 mod arch;
+mod cap;
 mod console;
 mod exception;
 mod gic;
@@ -324,9 +325,10 @@ const TASK_REDRAW_TICKS: u64 = irq::TICK_HZ / 10;
 /// Loads the user programs and starts them at EL0. Returns how many run.
 fn init_user() -> usize {
     match user::start() {
-        Ok(n) => {
+        Ok((n, caps)) => {
             println!("[user] {} programs at EL0, {} KiB ELF", n, user::elf_size() >> 10);
             ok(format_args!("M7: user space, {} address spaces", n));
+            ok(format_args!("M8: {} capabilities, 1 channel", caps));
             n
         }
         Err(e) => {
