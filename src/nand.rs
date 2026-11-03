@@ -224,3 +224,49 @@ impl Circuit {
         wires.iter().enumerate().map(|(i, &w)| (self.get(w) as u64) << i).sum()
     }
 }
+
+/// A NAND 4-bit ripple-carry adder with its input and output wires.
+pub struct Adder4 {
+    c: Circuit,
+    a: [Wire; 4],
+    b: [Wire; 4],
+    cin: Wire,
+    sum: [Wire; 4],
+    cout: Wire,
+}
+
+impl Adder4 {
+    pub fn new() -> Self {
+        let mut c = Circuit::new();
+        let (a, b, cin) = (c.inputs::<4>(), c.inputs::<4>(), c.input());
+        let (sum, cout) = c.adder(a, b, cin);
+        Self { c, a, b, cin, sum, cout }
+    }
+
+    pub fn gate_count(&self) -> usize {
+        self.c.gate_count()
+    }
+
+    /// Returns the 5-bit result of `x + y + carry_in`.
+    pub fn add(&mut self, x: u64, y: u64, carry_in: bool) -> u64 {
+        self.c.set_bits(&self.a, x);
+        self.c.set_bits(&self.b, y);
+        self.c.set(self.cin, carry_in);
+        self.c.eval().expect("adder did not settle");
+        self.c.get_bits(&self.sum) | (self.c.get(self.cout) as u64) << 4
+    }
+
+    /// Checks all 512 inputs against real addition; panics on a mismatch.
+    pub fn check_all(&mut self) {
+        for x in 0..16 {
+            for y in 0..16 {
+                for carry_in in [false, true] {
+                    let r = self.add(x, y, carry_in);
+                    if r != x + y + carry_in as u64 {
+                        panic!("4-bit adder: {} + {} + {} gave {}", x, y, carry_in as u8, r);
+                    }
+                }
+            }
+        }
+    }
+}

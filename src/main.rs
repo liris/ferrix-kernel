@@ -10,6 +10,7 @@ mod exception;
 mod gic;
 mod irq;
 mod keyboard;
+mod lab;
 mod mm;
 mod mmu;
 mod nand;
@@ -23,7 +24,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use nand::{Circuit, Wire};
+use nand::{Adder4, Circuit, Wire};
 use console::{ACCENT, DIM, ERR, FG, Format, Framebuffer, OK};
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
@@ -150,14 +151,17 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
     polling_loop(freq)
 }
 
-/// Redraws `line` in the dim colour.
+/// Redraws `line` in the dim colour, cut to the screen width: wrapping
+/// would overwrite the line below.
 fn status_line(line: usize, args: core::fmt::Arguments) {
+    let text = format!("{}", args);
     console::with(|c| {
         c.goto_line(line);
         c.set_color(DIM);
+        let cut = text.char_indices().nth(c.cols()).map_or(text.len(), |(i, _)| i);
+        core::fmt::Write::write_str(c, &text[..cut]).ok();
+        c.set_color(FG);
     });
-    print!("{}", args);
-    console::with(|c| c.set_color(FG));
 }
 
 fn uptime(line: usize, secs: u64) {
@@ -283,34 +287,11 @@ fn init_usb(rsdp: Option<usize>) -> bool {
     );
     let found = usb::init(hc);
     if found {
-        ok("M5: USB keyboard ready, type away");
+        ok("M5: USB keyboard ready");
     } else {
         println!("[usb ] no keyboard");
     }
     found
-}
-
-/// Longest input line kept; with the prompt it fits 48 columns.
-const INPUT_MAX: usize = 40;
-
-/// The input line: what has been typed since the last Enter.
-fn input_status(line: usize, keyboard: bool, text: &str) {
-    if !keyboard {
-        return status_line(line, format_args!("key> (no keyboard)"));
-    }
-    let errors = keyboard::errors();
-    console::with(|c| {
-        c.goto_line(line);
-        c.set_color(ACCENT);
-    });
-    print!("key> ");
-    console::with(|c| c.set_color(FG));
-    print!("{}_", text);
-    if errors > 0 {
-        console::with(|c| c.set_color(ERR));
-        print!(" err {}", errors);
-        console::with(|c| c.set_color(FG));
-    }
 }
 
 /// Task lines: CPU share per task (ticks it was running for), then progress.
@@ -325,67 +306,65 @@ fn task_status(line: usize) {
     status_line(
         line + 1,
         format_args!(
-            "spin {}  nand {}  fpu {}  sw {}",
-            SPIN_COUNT.load(Ordering::Relaxed),
+            "spin {}M  nand {}  fpu {}k  sw {}",
+            SPIN_COUNT.load(Ordering::Relaxed) / 1_000_000,
             NAND_ROUNDS.load(Ordering::Relaxed),
-            FPU_ROUNDS.load(Ordering::Relaxed),
+            FPU_ROUNDS.load(Ordering::Relaxed) / 1000,
             switches
         ),
-    );
-}
-
-fn counter_status(line: usize, level: bool, value: u64, edges: u64) {
-    status_line(
-        line,
-        format_args!("clk={}  q={:04b} ({:2})  edges={}", level as u8, value, value, edges),
     );
 }
 
 /// Ticks between redraws of the task lines (10 per second).
 const TASK_REDRAW_TICKS: u64 = irq::TICK_HZ / 10;
 
+/// The key help line, or why there is no keyboard; with the count of
+/// reports lost to USB errors, if any.
+fn help_status(line: usize, keyboard: bool) {
+    if !keyboard {
+        return status_line(line, format_args!("keys: (no keyboard)"));
+    }
+    status_line(line, format_args!("{}", lab::HELP));
+    let errors = keyboard::errors();
+    if errors > 0 {
+        console::with(|c| c.set_color(ERR));
+        print!(" err {}", errors);
+        console::with(|c| c.set_color(FG));
+    }
+}
+
 /// The `main` task: sleep a tick at a time; redraw the uptime and task lines,
-/// drive the NAND counter's clock from the tick count, and echo typed keys.
+/// clock the NAND counter from the tick count, and feed typed keys to the
+/// NAND lab.
 fn interrupt_loop(keyboard: bool) -> ! {
-    let mut c = Circuit::new();
-    let (clk, one) = (c.input(), c.input());
-    c.set(one, true);
-    let q = c.counter::<4>(clk, one);
-    c.eval().expect("counter did not settle");
-    println!("[ctr ] 4-bit counter, {} NAND, timer-clocked", c.gate_count());
-    // Reserve a blank spacer, then rows for uptime, counter, two task lines
-    // and input. Rows are taken relative to the cursor, which stays valid if
-    // the screen scrolls.
-    for _ in 0..5 {
+    let mut lab = lab::Lab::new();
+    println!("[lab ] counter {} NAND, adder {} NAND", lab.counter_gates(), lab.adder_gates());
+    // Reserve a blank spacer, then rows for uptime, counter, adder, two task
+    // lines and key help. Rows are taken relative to the cursor, which stays
+    // valid if the screen scrolls.
+    for _ in 0..6 {
         println!();
     }
-    let line = console::with(|c| c.row()).unwrap_or(4) - 4;
+    let line = console::with(|c| c.row()).unwrap_or(5) - 5;
     let mut seen = u64::MAX;
     let mut drawn = u64::MAX;
-    let mut level = false;
-    let mut edges = 0u64;
-    let mut value = c.get_bits(&q);
-    counter_status(line + 1, level, value, edges);
-    let mut input = String::new();
     let mut errors = keyboard::errors();
-    input_status(line + 4, keyboard, &input);
+    status_line(line + 1, format_args!("{}", lab.counter_line()));
+    status_line(line + 2, format_args!("{}", lab.adder_line()));
+    help_status(line + 5, keyboard);
     loop {
-        let mut typed = false;
         while let Some(ch) = keyboard::read() {
-            typed = true;
-            match ch {
-                '\n' => input.clear(),
-                '\x08' => {
-                    input.pop();
-                }
-                '\t' => {}
-                _ if input.len() < INPUT_MAX => input.push(ch),
-                _ => {}
+            let changed = lab.key(ch);
+            if changed.counter {
+                status_line(line + 1, format_args!("{}", lab.counter_line()));
+            }
+            if changed.adder {
+                status_line(line + 2, format_args!("{}", lab.adder_line()));
             }
         }
-        if typed || keyboard::errors() != errors {
+        if keyboard::errors() != errors {
             errors = keyboard::errors();
-            input_status(line + 4, keyboard, &input);
+            help_status(line + 5, keyboard);
         }
 
         let t = irq::ticks();
@@ -394,25 +373,10 @@ fn interrupt_loop(keyboard: bool) -> ! {
             if t / TASK_REDRAW_TICKS != drawn {
                 drawn = t / TASK_REDRAW_TICKS;
                 uptime(line, t / irq::TICK_HZ);
-                task_status(line + 2);
+                task_status(line + 3);
             }
-
-            let next_level = (t / HALF_PERIOD_TICKS) % 2 == 1;
-            if next_level != level {
-                level = next_level;
-                c.set(clk, level);
-                c.eval().expect("counter did not settle");
-                let now = c.get_bits(&q);
-                if level {
-                    edges += 1;
-                    if now != (value + 1) % 16 {
-                        panic!("counter went {} -> {} on a rising edge", value, now);
-                    }
-                } else if now != value {
-                    panic!("counter changed {} -> {} on a falling edge", value, now);
-                }
-                value = now;
-                counter_status(line + 1, level, value, edges);
+            if lab.timer_clock((t / HALF_PERIOD_TICKS) % 2 == 1) {
+                status_line(line + 1, format_args!("{}", lab.counter_line()));
             }
         }
         task::sleep(1);
@@ -637,49 +601,7 @@ fn nand_demo() {
         println!("[nand] {:2} + {:2} = {:2}  ({:04b} + {:04b} = {:05b})", x, y, r, x, y, r);
     }
     adder.check_all();
-    ok(format_args!("M2.5: 4-bit adder 512/512 ({} NAND)", adder.c.gate_count()));
-}
-
-/// A NAND 4-bit ripple-carry adder with its input and output wires.
-struct Adder4 {
-    c: Circuit,
-    a: [Wire; 4],
-    b: [Wire; 4],
-    cin: Wire,
-    sum: [Wire; 4],
-    cout: Wire,
-}
-
-impl Adder4 {
-    fn new() -> Self {
-        let mut c = Circuit::new();
-        let (a, b, cin) = (c.inputs::<4>(), c.inputs::<4>(), c.input());
-        let (sum, cout) = c.adder(a, b, cin);
-        Self { c, a, b, cin, sum, cout }
-    }
-
-    /// Returns the 5-bit result of `x + y + carry_in`.
-    fn add(&mut self, x: u64, y: u64, carry_in: bool) -> u64 {
-        self.c.set_bits(&self.a, x);
-        self.c.set_bits(&self.b, y);
-        self.c.set(self.cin, carry_in);
-        self.c.eval().expect("adder did not settle");
-        self.c.get_bits(&self.sum) | (self.c.get(self.cout) as u64) << 4
-    }
-
-    /// Checks all 512 inputs against real addition; panics on a mismatch.
-    fn check_all(&mut self) {
-        for x in 0..16 {
-            for y in 0..16 {
-                for carry_in in [false, true] {
-                    let r = self.add(x, y, carry_in);
-                    if r != x + y + carry_in as u64 {
-                        panic!("4-bit adder: {} + {} + {} gave {}", x, y, carry_in as u8, r);
-                    }
-                }
-            }
-        }
-    }
+    ok(format_args!("M2.5: 4-bit adder 512/512 ({} NAND)", adder.gate_count()));
 }
 
 fn banner() {

@@ -4,7 +4,7 @@
 
 Rust で書いた小さな AArch64 カーネルです。UEFI から起動し、VMware Fusion（Apple Silicon）と QEMU で動きます。
 
-UEFI アプリとして起動してフレームバッファ・メモリマップ・ACPI のポインタを集め、`ExitBootServices` を呼んだあとは自前のコードだけで動きます。例外ベクタ、ページアロケータとヒープ、自前のページテーブル、GICv3 のタイマー割り込み、プリエンプティブなラウンドロビンのタスク、自前の xHCI ドライバによる USB キーボード入力を備えています。あわせて、NAND だけを部品とする回路シミュレータで加算器と、タイマーをクロックにしたカウンタを組んでいます。
+UEFI アプリとして起動してフレームバッファ・メモリマップ・ACPI のポインタを集め、`ExitBootServices` を呼んだあとは自前のコードだけで動きます。例外ベクタ、ページアロケータとヒープ、自前のページテーブル、GICv3 のタイマー割り込み、プリエンプティブなラウンドロビンのタスク、自前の xHCI ドライバによる USB キーボード入力を備えています。あわせて、NAND だけを部品とする回路シミュレータで加算器とカウンタを組み、キーボードから操作できます。
 
 VMware Fusion での起動画面（抜粋）:
 
@@ -24,14 +24,15 @@ ferrix-kernel 0.1.0 (aarch64)
 [ ok ] M4: 5 tasks, round-robin, 10 ms slices
 [pci ] 01:00.0 xHCI 15ad:077a
 [usb ] port 6 full 0e0f:0006 keyboard
-[ ok ] M5: USB keyboard ready, type away
-[ctr ] 4-bit counter, 53 NAND, timer-clocked
+[ ok ] M5: USB keyboard ready
+[lab ] counter 53 NAND, adder 36 NAND
 
-uptime 00:01:30
-clk=1  q=1010 (10)  edges=91
+uptime 00:08:05
+ctr clk=1 q=0001 ( 1) edges=466 manual
+add a=0011 b=0010 c=0 -> 00101 (3+2+0=5)
 cpu% main 0 idle 0 spin 33 nand 33 fpu 33 kbd 0
-spin 14066695545  nand 875742  fpu 68638483  sw 15068
-key> keyboard typing test_
+spin 74033M  nand 4508075  fpu 351692k  sw 80953
+keys 1-4:a 5-8:b c:carry spc:clk m:mode
 ```
 
 ## 必要なもの
@@ -49,6 +50,17 @@ key> keyboard typing test_
 | `make vm` | VMware Fusion の VM を `build/ferrix-kernel.vmwarevm` に組み立てる |
 | `make vm-run` | その VM を組み立て、新しい ISO でコールドブートする |
 | `make run FEATURES=fault-test` | わざとヌルポインタを参照してパニック画面を出す |
+
+## キー操作
+
+`M5: USB keyboard ready` が出たあとは、画面下部の NAND 回路をキーボード（US 配列）で操作できます。
+
+| キー | 動作 |
+| --- | --- |
+| `1`-`4` / `5`-`8` | 加算器の入力 `a` / `b` のビットを反転（左が上位ビット） |
+| `c` | 加算器のキャリー入力を反転 |
+| スペース | カウンタのクロックを手で送る（手動モードになる） |
+| `m` | カウンタのクロックを手動とタイマーで切り替える |
 
 ## 設計
 

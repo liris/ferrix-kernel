@@ -100,6 +100,10 @@ impl Console {
         self.row
     }
 
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
     fn draw_glyph(&mut self, ch: char) {
         let idx = if ch.is_ascii() { ch as usize } else { b'?' as usize };
         let glyph = BASIC_LEGACY[idx];
