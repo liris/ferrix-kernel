@@ -2,9 +2,9 @@
 //! what is plugged in, and drive the first boot protocol keyboard.
 //!
 //! The keyboard is switched to the HID boot protocol, whose fixed 8-byte
-//! report needs no report descriptor parsing. A `kbd` task then keeps one
-//! interrupt IN transfer queued, polls for its completion once per tick and
-//! feeds each report to `keyboard`. Hubs are not supported yet, so only
+//! report needs no report descriptor parsing. A `kbd` task then keeps
+//! `xhci::IN_FLIGHT` interrupt IN transfers queued, polls for completions
+//! once per tick and feeds each report to `keyboard`. Hubs are not supported yet, so only
 //! devices on root ports are seen.
 
 use crate::keyboard::{self, BootKeyboard};
@@ -192,27 +192,26 @@ pub fn init(mut hc: Xhci) -> bool {
     true
 }
 
-/// Keeps one report request queued and passes every report on. A failed
-/// transfer is counted and simply requested again.
+/// Keeps report requests queued and passes every report on, in order. A
+/// failed transfer is counted and simply requested again.
 fn keyboard_task() {
     let taken = crate::arch::without_irqs(|| unsafe { (*HANDOVER.0.get()).take() });
     let Some((mut hc, mut ep)) = taken else {
         return;
     };
     let mut kbd = BootKeyboard::default();
+    for i in 0..xhci::IN_FLIGHT {
+        hc.submit(&mut ep, i);
+    }
     loop {
-        hc.submit(&mut ep);
-        loop {
-            match hc.poll(&ep) {
-                None => task::sleep(1),
-                Some(Ok(len)) => {
-                    kbd.report(ep.data(len));
-                    break;
+        match hc.poll(&mut ep) {
+            None => task::sleep(1),
+            Some((i, result)) => {
+                match result {
+                    Ok(len) => kbd.report(ep.data(i, len)),
+                    Err(_) => keyboard::count_error(),
                 }
-                Some(Err(_)) => {
-                    keyboard::count_error();
-                    break;
-                }
+                hc.submit(&mut ep, i);
             }
         }
     }

@@ -8,7 +8,15 @@
 //! combinational circuit settles in one sweep plus one to confirm; circuits
 //! with feedback (latches, M3) take more sweeps, and an oscillating one is
 //! reported as unstable. Pure logic: no hardware access, no `unsafe`.
+//!
+//! A crate of its own because both the kernel (demos, `lab`) and the user
+//! space circuit builder (M9) simulate with it.
 
+#![no_std]
+
+extern crate alloc;
+
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub type Wire = usize;
@@ -19,6 +27,7 @@ struct Nand {
     out: Wire,
 }
 
+#[derive(Default)]
 pub struct Circuit {
     gates: Vec<Nand>,
     values: Vec<bool>,
@@ -52,6 +61,28 @@ impl Circuit {
 
     pub fn gate_count(&self) -> usize {
         self.gates.len()
+    }
+
+    /// The wires no gate drives (inputs, and forward wires never driven)
+    /// that `w` depends on, in creation order.
+    pub fn sources(&self, w: Wire) -> Vec<Wire> {
+        let mut driver = vec![None; self.values.len()];
+        for g in &self.gates {
+            driver[g.out] = Some((g.a, g.b));
+        }
+        let mut seen = vec![false; self.values.len()];
+        let (mut todo, mut found) = (vec![w], Vec::new());
+        while let Some(x) = todo.pop() {
+            if core::mem::replace(&mut seen[x], true) {
+                continue;
+            }
+            match driver[x] {
+                Some((a, b)) => todo.extend([a, b]),
+                None => found.push(x),
+            }
+        }
+        found.sort();
+        found
     }
 
     pub fn set(&mut self, w: Wire, v: bool) {

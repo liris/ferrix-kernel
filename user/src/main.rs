@@ -13,12 +13,19 @@
 //!   slot numbers. Every attempt must be refused.
 //! - `bad`: tries to read kernel memory at the address in x1, which must
 //!   kill it and nothing else.
+//! - `builder`: the circuit builder (`builder`), fed by the keyboard
+//!   channel in slot 1.
 //!
 //! Every program gets its own screen line as capability slot 0 and shows
 //! everything through it.
 
 #![no_std]
 #![no_main]
+
+extern crate alloc;
+
+mod builder;
+mod heap;
 
 use core::arch::asm;
 use core::fmt::{self, Write};
@@ -31,6 +38,7 @@ const SYS_WRITE: u64 = 1;
 const SYS_SLEEP: u64 = 2;
 const SYS_SEND: u64 = 3;
 const SYS_RECV: u64 = 4;
+const SYS_WAIT: u64 = 5;
 
 const OK: u64 = 0;
 const ERR_CAP: u64 = 1;
@@ -40,6 +48,7 @@ const ROLE_SPIN: u64 = 1;
 const ROLE_SINK: u64 = 2;
 const ROLE_FORGE: u64 = 3;
 const ROLE_BAD: u64 = 4;
+const ROLE_BUILDER: u64 = 5;
 
 /// Capability slots handed out by the kernel.
 const SCREEN: u64 = 0;
@@ -82,27 +91,86 @@ fn recv(cap: u64) -> Option<u64> {
     }
 }
 
-/// One line of text, formatted on the stack.
+/// Blocks until the channel in slot `cap` has a message. `None` if `cap`
+/// is not a receiving end.
+fn wait(cap: u64) -> Option<u64> {
+    match syscall(SYS_WAIT, cap, 0, 0) {
+        (OK, value) => Some(value),
+        _ => None,
+    }
+}
+
+/// One screen line of text, formatted on the stack; longer text is cut.
 struct Line {
-    buf: [u8; 48],
+    buf: [u8; Line::CAPACITY],
     len: usize,
+}
+
+impl Line {
+    /// What the kernel shows of a line.
+    const CAPACITY: usize = 44;
+
+    fn new() -> Self {
+        Self { buf: [0; Self::CAPACITY], len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn pop(&mut self) {
+        self.len = self.len.saturating_sub(1);
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Only whole characters are ever stored, so this cannot fail.
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).unwrap_or("")
+    }
 }
 
 impl Write for Line {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let n = s.len().min(self.buf.len() - self.len);
+        let mut n = s.len().min(Self::CAPACITY - self.len);
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
         self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
         self.len += n;
         Ok(())
     }
 }
 
-/// Writes a line through the screen capability in slot `cap`; returns the
-/// status.
+/// Replaces row `row` of the screen lines in slot `cap`; returns the status.
+fn write_row(cap: u64, row: u64, text: &[u8]) -> u64 {
+    let r0: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") cap => r0,
+            inlateout("x1") text.as_ptr() as u64 => _,
+            in("x2") text.len() as u64,
+            in("x3") row,
+            in("x8") SYS_WRITE,
+            options(nostack),
+        )
+    };
+    r0
+}
+
+/// Writes the first line through the screen capability in slot `cap`;
+/// returns the status.
 fn write(cap: u64, args: fmt::Arguments) -> u64 {
-    let mut line = Line { buf: [0; 48], len: 0 };
+    let mut line = Line::new();
     let _ = line.write_fmt(args);
-    syscall(SYS_WRITE, cap, line.buf.as_ptr() as u64, line.len as u64).0
+    write_row(cap, 0, line.as_bytes())
 }
 
 /// Replaces this program's own line on screen.
@@ -132,14 +200,20 @@ fn spin() -> ! {
     }
 }
 
+/// Sleeps in `wait` until a value arrives, then takes whatever else is
+/// queued without blocking.
 fn sink() -> ! {
     let mut got = 0u64;
     loop {
+        let Some(mut last) = wait(CHANNEL) else {
+            exit(4);
+        };
+        got += 1;
         while let Some(n) = recv(CHANNEL) {
             got += 1;
-            show(format_args!("sink  {} msgs, last n={}", got, n));
+            last = n;
         }
-        sleep(5);
+        show(format_args!("sink  {} msgs, last n={}", got, last));
     }
 }
 
@@ -177,6 +251,7 @@ pub extern "C" fn _start(role: u64, arg: u64) -> ! {
         ROLE_SINK => sink(),
         ROLE_FORGE => forge(),
         ROLE_BAD => bad(arg),
+        ROLE_BUILDER => builder::run(),
         _ => exit(2),
     }
 }

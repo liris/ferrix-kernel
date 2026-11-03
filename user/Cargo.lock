@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "ferrix-user"
 version = "0.1.0"
+dependencies = [
+ "nand",
+]
+
+[[package]]
+name = "nand"
+version = "0.1.0"

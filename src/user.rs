@@ -1,4 +1,4 @@
-//! User programs (M7, M8): loading, system calls and faults.
+//! User programs (M7-M9): loading, system calls and faults.
 //!
 //! The user program is an ELF built from `user/` (see `build.rs`) and
 //! embedded in the kernel. Each instance gets an address space of its own,
@@ -11,13 +11,19 @@
 //! | x8 | Call | Arguments | Result |
 //! | --- | --- | --- | --- |
 //! | 0 | exit | x0 = code | (does not return) |
-//! | 1 | write | x0 = `Screen` cap, x1 = pointer, x2 = length: replaces that line | x0 = status |
+//! | 1 | write | x0 = `Screen` cap, x1 = pointer, x2 = length, x3 = row in its range: replaces that line | x0 = status |
 //! | 2 | sleep | x0 = timer ticks | x0 = 0 |
 //! | 3 | send | x0 = `Send` cap, x1 = value | x0 = status |
 //! | 4 | recv | x0 = `Recv` cap | x0 = status, x1 = value |
+//! | 5 | wait | x0 = `Recv` cap: like recv, but blocks while the channel is empty | x0 = status, x1 = value |
 //!
-//! Status: 0 done, 1 no such capability (or the wrong kind), 2 bad pointer,
-//! 3 channel empty, 4 channel full. Nothing blocks.
+//! Status: 0 done, 1 no such capability (or the wrong kind, or a row outside
+//! the range), 2 bad pointer, 3 channel empty, 4 channel full.
+//!
+//! A `wait` on an empty channel blocks the task with ELR moved back onto
+//! the `svc`, so once a `send` wakes it the call simply runs again. Typed
+//! keys go into a channel of their own (`send_key`), whose receiving end
+//! only the circuit builder holds.
 //!
 //! Pointers from user space are checked with the MMU (`at s1e0r`) before
 //! the kernel reads through them, and the reads themselves are unprivileged
@@ -41,6 +47,7 @@ const SYS_WRITE: u64 = 1;
 const SYS_SLEEP: u64 = 2;
 const SYS_SEND: u64 = 3;
 const SYS_RECV: u64 = 4;
+const SYS_WAIT: u64 = 5;
 
 const OK: u64 = 0;
 const ERR_CAP: u64 = 1;
@@ -54,6 +61,13 @@ const ROLE_SPIN: u64 = 1;
 const ROLE_SINK: u64 = 2;
 const ROLE_FORGE: u64 = 3;
 const ROLE_BAD: u64 = 4;
+const ROLE_BUILDER: u64 = 5;
+
+const CHANNEL_DEPTH: usize = 8;
+/// Keys typed faster than the builder reads them wait here.
+const KEY_DEPTH: usize = 32;
+/// The builder's screen: 8 lines of output and 1 input line.
+const BUILDER_ROWS: usize = 9;
 
 /// 16 KiB of user stack, ending at the top of the user range.
 const STACK_PAGES: usize = 4;
@@ -73,15 +87,19 @@ struct Program {
     task: usize,
     name: &'static str,
     caps: CapTable,
+    /// Its first screen line, where the kernel notes how it ended.
+    first: usize,
 }
 
-/// Everything user programs can reach through capabilities. Program `n`
-/// is shown on screen line `n`.
+/// Everything user programs can reach through capabilities.
 #[derive(Default)]
 struct State {
     programs: Vec<Program>,
     lines: Vec<String>,
+    /// Bumped on every change to `lines`, so they are redrawn only then.
+    generation: u64,
     channels: Channels,
+    keys: Option<usize>,
 }
 
 struct Global(UnsafeCell<Option<State>>);
@@ -156,25 +174,35 @@ fn load(elf: &[u8]) -> Result<(AddressSpace, u64), &'static str> {
     Ok((space, entry))
 }
 
-/// Starts the demo programs, each with its own line on screen and only the
+/// Starts the demo programs, each with its own lines on screen and only the
 /// capabilities listed for it. Returns (programs, capabilities handed out).
 pub fn start() -> Result<(usize, usize), &'static str> {
     arch::allow_fp_at_el0();
     let secret = &KERNEL_SECRET as *const u64 as u64;
-    let chan = with(|s| s.channels.create());
-    let programs = [
-        ("u1", ROLE_COUNT, 0, &[Cap::Screen(0), Cap::Send(chan)][..]),
-        ("u2", ROLE_SPIN, 0, &[Cap::Screen(1)][..]),
-        ("u3", ROLE_SINK, 0, &[Cap::Screen(2), Cap::Recv(chan)][..]),
-        ("u4", ROLE_FORGE, 0, &[Cap::Screen(3)][..]),
-        ("u5", ROLE_BAD, secret, &[Cap::Screen(4)][..]),
+    let (chan, keys) = with(|s| {
+        let keys = s.channels.create(KEY_DEPTH);
+        s.keys = Some(keys);
+        (s.channels.create(CHANNEL_DEPTH), keys)
+    });
+    // (name, role, argument, rows on screen, capabilities after its screen)
+    let programs: [(&str, u64, u64, usize, &[Cap]); 6] = [
+        ("u1", ROLE_COUNT, 0, 1, &[Cap::Send(chan)]),
+        ("u2", ROLE_SPIN, 0, 1, &[]),
+        ("u3", ROLE_SINK, 0, 1, &[Cap::Recv(chan)]),
+        ("u4", ROLE_FORGE, 0, 1, &[]),
+        ("u5", ROLE_BAD, secret, 1, &[]),
+        ("u6", ROLE_BUILDER, 0, BUILDER_ROWS, &[Cap::Recv(keys)]),
     ];
-    for (name, role, arg, caps) in programs {
+    for (name, role, arg, rows, extra) in programs {
         let (space, entry) = load(ELF)?;
         // Registered before the task can run, so its first call finds it.
         with(|s| {
-            s.lines.push(String::from("starting"));
-            s.programs.push(Program { task: usize::MAX, name, caps: CapTable::new(caps) });
+            let first = s.lines.len();
+            s.lines.resize(first + rows, String::new());
+            s.lines[first] = String::from("starting");
+            let mut caps = Vec::from([Cap::Screen { first, rows }]);
+            caps.extend_from_slice(extra);
+            s.programs.push(Program { task: usize::MAX, name, caps: CapTable::new(&caps), first });
         });
         // The address space lives as long as the task: it is never freed.
         let id = task::spawn_user(name, space.ttbr(), entry, STACK_TOP, [role, arg]);
@@ -187,9 +215,37 @@ pub fn elf_size() -> usize {
     ELF.len()
 }
 
-/// Each program's name and current line.
-pub fn lines() -> Vec<(&'static str, String)> {
-    with(|s| s.programs.iter().zip(&s.lines).map(|(p, l)| (p.name, l.clone())).collect())
+/// All user screen lines, each with the name of the program it starts (on
+/// a program's first line only).
+pub fn lines() -> Vec<(Option<&'static str>, String)> {
+    with(|s| {
+        s.lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (s.programs.iter().find(|p| p.first == i).map(|p| p.name), l.clone()))
+            .collect()
+    })
+}
+
+/// Changes whenever any user line does.
+pub fn generation() -> u64 {
+    with(|s| s.generation)
+}
+
+/// Hands a typed key to whoever holds the keyboard channel. Returns false
+/// if it was dropped (channel full, or no user programs).
+pub fn send_key(key: char) -> bool {
+    let Some(keys) = with(|s| s.keys) else {
+        return false;
+    };
+    let sent = with(|s| s.channels.send(keys, key as u64));
+    task::wake(keys as u64);
+    sent
+}
+
+fn set_line(s: &mut State, line: usize, text: String) {
+    s.lines[line] = text;
+    s.generation += 1;
 }
 
 /// Index of the running program, and the capability in its slot `n`.
@@ -199,11 +255,12 @@ fn lookup(s: &State, n: u64) -> (Option<usize>, Option<Cap>) {
     (i, i.and_then(|i| s.programs[i].caps.get(n)))
 }
 
-/// The kernel's own note on the running program's line (exit, fault).
+/// The kernel's own note on the running program's first line (exit, fault).
 fn note(text: String) {
     with(|s| {
         if let (Some(i), _) = lookup(s, 0) {
-            s.lines[i] = text;
+            let first = s.programs[i].first;
+            set_line(s, first, text);
         }
     });
 }
@@ -231,7 +288,7 @@ fn read_user(ptr: u64, len: u64) -> Option<String> {
 /// `svc #0` from EL0. Returns the frame to resume.
 pub fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     let f = unsafe { &mut *frame };
-    let (a, b, c) = (f.x[0], f.x[1], f.x[2]);
+    let (a, b, c, d) = (f.x[0], f.x[1], f.x[2], f.x[3]);
     match f.x[8] {
         SYS_EXIT => {
             note(format!("exited ({})", a));
@@ -243,9 +300,9 @@ pub fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         }
         SYS_WRITE => {
             f.x[0] = match with(|s| lookup(s, a).1) {
-                Some(Cap::Screen(line)) => match read_user(b, c) {
+                Some(Cap::Screen { first, rows }) if (d as usize) < rows => match read_user(b, c) {
                     Some(text) => {
-                        with(|s| s.lines[line] = text);
+                        with(|s| set_line(s, first + d as usize, text));
                         OK
                     }
                     None => ERR_POINTER,
@@ -254,19 +311,30 @@ pub fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
             };
         }
         SYS_SEND => {
-            f.x[0] = with(|s| match lookup(s, a).1 {
-                Some(Cap::Send(chan)) if s.channels.send(chan, b) => OK,
-                Some(Cap::Send(_)) => ERR_FULL,
+            f.x[0] = match with(|s| lookup(s, a).1) {
+                Some(Cap::Send(chan)) => {
+                    let sent = with(|s| s.channels.send(chan, b));
+                    task::wake(chan as u64);
+                    if sent { OK } else { ERR_FULL }
+                }
                 _ => ERR_CAP,
-            });
+            };
         }
-        SYS_RECV => {
-            let (status, value) = with(|s| match lookup(s, a).1 {
-                Some(Cap::Recv(chan)) => s.channels.recv(chan).map_or((ERR_EMPTY, 0), |v| (OK, v)),
-                _ => (ERR_CAP, 0),
+        SYS_RECV | SYS_WAIT => {
+            let got = with(|s| match lookup(s, a).1 {
+                Some(Cap::Recv(chan)) => Ok((chan, s.channels.recv(chan))),
+                _ => Err(()),
             });
-            f.x[0] = status;
-            f.x[1] = value;
+            match got {
+                Ok((_, Some(value))) => (f.x[0], f.x[1]) = (OK, value),
+                Ok((chan, None)) if f.x[8] == SYS_WAIT => {
+                    // Back onto the `svc`: it runs again once woken.
+                    f.elr -= 4;
+                    return task::block_from_trap(frame, chan as u64);
+                }
+                Ok((_, None)) => (f.x[0], f.x[1]) = (ERR_EMPTY, 0),
+                Err(()) => (f.x[0], f.x[1]) = (ERR_CAP, 0),
+            }
         }
         _ => f.x[0] = ERR_CAP,
     }

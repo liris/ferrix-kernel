@@ -7,7 +7,7 @@
 //! on each rising edge and hold on each falling edge, and the adder must
 //! add. Pure logic: drawing and key input stay in `main`.
 
-use crate::nand::{Adder4, Circuit, Wire};
+use nand::{Adder4, Circuit, Wire};
 use alloc::format;
 use alloc::string::String;
 

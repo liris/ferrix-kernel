@@ -35,6 +35,8 @@ pub enum State {
     Ready,
     /// Not runnable until the tick count reaches this value.
     Sleeping(u64),
+    /// Not runnable until `wake` is called with this tag.
+    Blocked(u64),
     Dead,
 }
 
@@ -133,6 +135,27 @@ pub fn sleep_from_trap(frame: *mut TrapFrame, ticks: u64) -> *mut TrapFrame {
         s.tasks[me].state = State::Sleeping(irq::ticks() + ticks);
     });
     switch(frame, false)
+}
+
+/// From an exception: blocks the running task until `wake(tag)` and
+/// returns the frame to resume instead.
+pub fn block_from_trap(frame: *mut TrapFrame, tag: u64) -> *mut TrapFrame {
+    with(|s| {
+        let me = s.current;
+        s.tasks[me].state = State::Blocked(tag);
+    });
+    switch(frame, false)
+}
+
+/// Makes every task blocked on `tag` ready again.
+pub fn wake(tag: u64) {
+    with(|s| {
+        for t in &mut s.tasks {
+            if t.state == State::Blocked(tag) {
+                t.state = State::Ready;
+            }
+        }
+    });
 }
 
 /// From an exception: ends the running task for good and returns the frame

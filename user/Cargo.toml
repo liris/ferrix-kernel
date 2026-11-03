@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+nand = { path = "../nand" }
 
 [profile.dev]
 panic = "abort"

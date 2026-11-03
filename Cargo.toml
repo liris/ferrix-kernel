@@ -6,6 +6,7 @@ license = "MIT"
 
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false }
+nand = { path = "nand" }
 uefi = { version = "0.41.0" }
 
 [features]

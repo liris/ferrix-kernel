@@ -8,8 +8,9 @@ It starts as a UEFI application, collects the framebuffer, memory map and ACPI p
 `ExitBootServices`, and then runs on its own code only: exception vectors, a page allocator and
 heap, its own page tables, GICv3 timer interrupts, preemptive round-robin tasks, a USB keyboard
 through its own xHCI driver, and user programs at EL0 in their own address spaces that can only use
-the capabilities they were given. Alongside, a circuit simulator whose only primitive is NAND
-builds adders and a counter, which can be driven from the keyboard.
+the capabilities they were given, one of them a circuit builder you type NAND circuits into.
+Alongside, a circuit simulator whose only primitive is NAND builds adders and a counter, which can
+be driven from the keyboard.
 
 Excerpt of a boot on VMware Fusion:
 
@@ -30,9 +31,10 @@ ferrix-kernel 0.1.0 (aarch64)
 [pci ] 01:00.0 xHCI 15ad:077a
 [usb ] port 6 full 0e0f:0006 keyboard
 [ ok ] M5: USB keyboard ready
-[user] 5 programs at EL0, 16 KiB ELF
-[ ok ] M7: user space, 5 address spaces
-[ ok ] M8: 7 capabilities, 1 channel
+[user] 6 programs at EL0, 48 KiB ELF
+[ ok ] M7: user space, 6 address spaces
+[ ok ] M8: 9 capabilities, 2 channels
+[ ok ] M9: circuit builder u6 has the keyboard
 [lab ] counter 53 NAND, adder 36 NAND
 
 uptime 00:04:12
@@ -45,7 +47,10 @@ u2 spin  n=19561M &n=0x400000003000
 u3 sink  2101 msgs, last n=2101
 u4 forge 2024/2024 other slots denied
 u5 killed: read 0x9bdd5348 no permission
-keys 1-4:a 5-8:b c:carry spc:clk m:mode
+u6 > table y
+   a b | y  (4 NAND in all)
+   00>0 01>1 10>1 11>0
+keys -> u6 circuit builder  tab:lab
 ```
 
 ## Requirements
@@ -67,7 +72,7 @@ keys 1-4:a 5-8:b c:carry spc:clk m:mode
 
 ## Keys
 
-Once `M5: USB keyboard ready` appears, the NAND circuits at the bottom of the screen follow the
+After Tab hands the keyboard to the lab, the NAND circuits at the bottom of the screen follow the
 keyboard (US layout):
 
 | Key | Effect |
@@ -76,6 +81,24 @@ keyboard (US layout):
 | `c` | Toggle the adder's carry in |
 | Space | Step the counter's clock by hand (switches to manual mode) |
 | `m` | Switch the counter between manual and timer clock |
+
+## Circuit builder
+
+Program `u6` at the bottom of the screen has the keyboard at boot (Tab switches between it and the
+lab). Type a command and press Enter. The only built-in gate is `nand`:
+
+```
+demo                 load parts not, and, or, xor, mux
+in a b               make inputs
+y = xor a b          build a wire from gates and parts (parentheses optional)
+def and a b = not (nand a b)
+def xor a b = n = nand a b; nand (nand a n) (nand b n)
+table y              truth table over the inputs y depends on (up to 4)
+set a 1              change an input and show all values
+q = wire             a wire driven later, for feedback:
+q <- nand sn qn      ... drive it with one NAND
+show [x ...]   parts   clear   help
+```
 
 ## Design
 

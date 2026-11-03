@@ -4,7 +4,7 @@
 
 Rust で書いた小さな AArch64 カーネルです。UEFI から起動し、VMware Fusion（Apple Silicon）と QEMU で動きます。
 
-UEFI アプリとして起動してフレームバッファ・メモリマップ・ACPI のポインタを集め、`ExitBootServices` を呼んだあとは自前のコードだけで動きます。例外ベクタ、ページアロケータとヒープ、自前のページテーブル、GICv3 のタイマー割り込み、プリエンプティブなラウンドロビンのタスク、自前の xHCI ドライバによる USB キーボード入力、専用のアドレス空間で EL0 で動き、渡された capability しか使えないユーザープログラムを備えています。あわせて、NAND だけを部品とする回路シミュレータで加算器とカウンタを組み、キーボードから操作できます。
+UEFI アプリとして起動してフレームバッファ・メモリマップ・ACPI のポインタを集め、`ExitBootServices` を呼んだあとは自前のコードだけで動きます。例外ベクタ、ページアロケータとヒープ、自前のページテーブル、GICv3 のタイマー割り込み、プリエンプティブなラウンドロビンのタスク、自前の xHCI ドライバによる USB キーボード入力、専用のアドレス空間で EL0 で動き、渡された capability しか使えないユーザープログラムを備えています。その一つは、NAND 回路を打ち込んで組み立てられる回路ビルダーです。あわせて、NAND だけを部品とする回路シミュレータで加算器とカウンタを組み、キーボードから操作できます。
 
 VMware Fusion での起動画面（抜粋）:
 
@@ -25,9 +25,10 @@ ferrix-kernel 0.1.0 (aarch64)
 [pci ] 01:00.0 xHCI 15ad:077a
 [usb ] port 6 full 0e0f:0006 keyboard
 [ ok ] M5: USB keyboard ready
-[user] 5 programs at EL0, 16 KiB ELF
-[ ok ] M7: user space, 5 address spaces
-[ ok ] M8: 7 capabilities, 1 channel
+[user] 6 programs at EL0, 48 KiB ELF
+[ ok ] M7: user space, 6 address spaces
+[ ok ] M8: 9 capabilities, 2 channels
+[ ok ] M9: circuit builder u6 has the keyboard
 [lab ] counter 53 NAND, adder 36 NAND
 
 uptime 00:04:12
@@ -40,7 +41,10 @@ u2 spin  n=19561M &n=0x400000003000
 u3 sink  2101 msgs, last n=2101
 u4 forge 2024/2024 other slots denied
 u5 killed: read 0x9bdd5348 no permission
-keys 1-4:a 5-8:b c:carry spc:clk m:mode
+u6 > table y
+   a b | y  (4 NAND in all)
+   00>0 01>1 10>1 11>0
+keys -> u6 circuit builder  tab:lab
 ```
 
 ## 必要なもの
@@ -62,7 +66,7 @@ keys 1-4:a 5-8:b c:carry spc:clk m:mode
 
 ## キー操作
 
-`M5: USB keyboard ready` が出たあとは、画面下部の NAND 回路をキーボード（US 配列）で操作できます。
+Tab でキーボードを lab に切り替えると、画面下部の NAND 回路をキーボード（US 配列）で操作できます。
 
 | キー | 動作 |
 | --- | --- |
@@ -70,6 +74,23 @@ keys 1-4:a 5-8:b c:carry spc:clk m:mode
 | `c` | 加算器のキャリー入力を反転 |
 | スペース | カウンタのクロックを手で送る（手動モードになる） |
 | `m` | カウンタのクロックを手動とタイマーで切り替える |
+
+## 回路ビルダー
+
+画面下部のプログラム `u6` は、起動時にキーボードを受け取ります（Tab で lab と切り替え）。コマンドを打って Enter を押します。組み込みのゲートは `nand` だけです。
+
+```
+demo                 部品 not, and, or, xor, mux を読み込む
+in a b               入力を作る
+y = xor a b          ゲートと部品で配線を作る（括弧は省略可）
+def and a b = not (nand a b)
+def xor a b = n = nand a b; nand (nand a n) (nand b n)
+table y              y が依存する入力（4 個まで）の真理値表
+set a 1              入力を変えて全部の値を表示
+q = wire             後から駆動する配線（フィードバック用）
+q <- nand sn qn      ... それを NAND 1 個で駆動する
+show [x ...]   parts   clear   help
+```
 
 ## 設計
 

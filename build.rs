@@ -25,4 +25,5 @@ fn main() {
     println!("cargo:rerun-if-changed=user/Cargo.toml");
     println!("cargo:rerun-if-changed=user/build.rs");
     println!("cargo:rerun-if-changed=user/link.ld");
+    println!("cargo:rerun-if-changed=nand/src");
 }

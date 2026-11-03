@@ -264,18 +264,31 @@ impl Device {
     }
 }
 
-/// A configured interrupt IN endpoint with one buffer of `len` bytes.
+/// Transfers an interrupt IN endpoint can have queued at once.
+///
+/// With only one, there is a window after each completion, until the next
+/// `submit`, in which nothing is queued; QEMU's keyboard was seen to stop
+/// reporting for good when keys came in that window. Keeping several queued
+/// closes it.
+pub const IN_FLIGHT: usize = 4;
+
+/// A configured interrupt IN endpoint with `IN_FLIGHT` buffers of `len`
+/// bytes each.
 pub struct InterruptIn {
     slot: u8,
     dci: u32,
     ring: Ring,
     buf: usize,
     len: u32,
+    /// The buffer the next completion belongs to: transfers on one ring
+    /// complete in the order they were queued.
+    done: usize,
 }
 
 impl InterruptIn {
-    pub fn data(&self, len: usize) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.buf as *const u8, len.min(self.len as usize)) }
+    pub fn data(&self, index: usize, len: usize) -> &[u8] {
+        let at = self.buf + index * self.len as usize;
+        unsafe { core::slice::from_raw_parts(at as *const u8, len.min(self.len as usize)) }
     }
 }
 
@@ -581,28 +594,32 @@ impl Xhci {
             *ctx.add(4) = max_packet as u32 | (max_packet as u32) << 16;
         }
         self.input_command(dev, TRB_CONFIGURE_ENDPOINT)?;
-        Ok(InterruptIn { slot: dev.slot, dci, ring, buf: dma_pages(1), len: max_packet as u32 })
+        // Interrupt endpoints carry at most 1024 bytes per packet.
+        let buf = dma_pages((IN_FLIGHT * max_packet as usize).div_ceil(mm::PAGE_SIZE));
+        Ok(InterruptIn { slot: dev.slot, dci, ring, buf, len: max_packet as u32, done: 0 })
     }
 
-    /// Queues one transfer into the endpoint's buffer.
-    pub fn submit(&mut self, ep: &mut InterruptIn) {
-        let buf = ep.buf as u64;
+    /// Queues one transfer into buffer `index` of the endpoint.
+    pub fn submit(&mut self, ep: &mut InterruptIn, index: usize) {
+        let buf = (ep.buf + index * ep.len as usize) as u64;
         let flags = TRB_NORMAL << 10 | TRB_IOC | TRB_SHORT_OK;
         ep.ring.push([buf as u32, (buf >> 32) as u32, ep.len, flags]);
         self.ring_doorbell(ep.slot, ep.dci);
     }
 
-    /// Checks for the completion of the transfer queued by `submit`: the
-    /// number of bytes received, an error, or `None` while it is pending.
-    pub fn poll(&mut self, ep: &InterruptIn) -> Option<Result<usize, &'static str>> {
+    /// Checks for the next completed transfer: which buffer, and the number
+    /// of bytes received or an error. `None` while none has completed.
+    pub fn poll(&mut self, ep: &mut InterruptIn) -> Option<(usize, Result<usize, &'static str>)> {
         while let Some(e) = self.events.pop(self.ir) {
             let mine = e[3] >> 24 == ep.slot as u32 && (e[3] >> 16) & 0x1f == ep.dci;
             if trb_type(&e) == EVENT_TRANSFER && mine {
+                let index = ep.done;
+                ep.done = (ep.done + 1) % IN_FLIGHT;
                 if !completion_ok(&e) {
-                    return Some(Err("interrupt transfer failed"));
+                    return Some((index, Err("interrupt transfer failed")));
                 }
                 // The event reports how many bytes were *not* transferred.
-                return Some(Ok(ep.len.saturating_sub(e[2] & 0xff_ffff) as usize));
+                return Some((index, Ok(ep.len.saturating_sub(e[2] & 0xff_ffff) as usize)));
             }
         }
         None

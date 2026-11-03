@@ -14,7 +14,6 @@ mod keyboard;
 mod lab;
 mod mm;
 mod mmu;
-mod nand;
 mod pci;
 mod task;
 mod usb;
@@ -143,8 +142,8 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
             ok(format_args!("M3: virtual timer IRQ at {} Hz", irq::TICK_HZ));
             start_tasks();
             let keyboard = init_usb(info.rsdp);
-            let programs = init_user();
-            interrupt_loop(keyboard, programs)
+            let builder = init_user();
+            interrupt_loop(keyboard, builder)
         }
         Some(Err(e)) => println!("[gic ] {}", e),
         None => println!("[gic ] not found"),
@@ -322,29 +321,42 @@ fn task_status(line: usize) {
 /// Ticks between redraws of the task lines (10 per second).
 const TASK_REDRAW_TICKS: u64 = irq::TICK_HZ / 10;
 
-/// Loads the user programs and starts them at EL0. Returns how many run.
-fn init_user() -> usize {
+/// Loads the user programs and starts them at EL0. Returns whether they
+/// run (and with them the circuit builder).
+fn init_user() -> bool {
     match user::start() {
         Ok((n, caps)) => {
             println!("[user] {} programs at EL0, {} KiB ELF", n, user::elf_size() >> 10);
             ok(format_args!("M7: user space, {} address spaces", n));
-            ok(format_args!("M8: {} capabilities, 1 channel", caps));
-            n
+            ok(format_args!("M8: {} capabilities, 2 channels", caps));
+            ok("M9: circuit builder u6 has the keyboard");
+            true
         }
         Err(e) => {
             println!("[user] {}", e);
-            0
+            false
         }
     }
 }
 
-/// The key help line, or why there is no keyboard; with the count of
-/// reports lost to USB errors, if any.
-fn help_status(line: usize, keyboard: bool) {
+/// Where typed keys go: the kernel's NAND lab, or the circuit builder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Lab,
+    Builder,
+}
+
+/// The key help line for the current focus, or why there is no keyboard;
+/// with the count of reports lost to USB errors, if any.
+fn help_status(line: usize, keyboard: bool, focus: Focus, builder: bool) {
     if !keyboard {
         return status_line(line, format_args!("keys: (no keyboard)"));
     }
-    status_line(line, format_args!("{}", lab::HELP));
+    match (focus, builder) {
+        (Focus::Lab, false) => status_line(line, format_args!("{}", lab::HELP)),
+        (Focus::Lab, true) => status_line(line, format_args!("{}  tab:u6", lab::HELP)),
+        (Focus::Builder, _) => status_line(line, format_args!("keys -> u6 circuit builder  tab:lab")),
+    }
     let errors = keyboard::errors();
     if errors > 0 {
         console::with(|c| c.set_color(ERR));
@@ -354,15 +366,16 @@ fn help_status(line: usize, keyboard: bool) {
 }
 
 /// The `main` task: sleep a tick at a time; redraw the uptime and task lines,
-/// clock the NAND counter from the tick count, and feed typed keys to the
-/// NAND lab.
-fn interrupt_loop(keyboard: bool, programs: usize) -> ! {
+/// clock the NAND counter from the tick count, and pass typed keys to the
+/// NAND lab or the circuit builder (Tab switches).
+fn interrupt_loop(keyboard: bool, builder: bool) -> ! {
     let mut lab = lab::Lab::new();
     println!("[lab ] counter {} NAND, adder {} NAND", lab.counter_gates(), lab.adder_gates());
     // Reserve a blank spacer, then rows for uptime, counter, adder, two task
-    // lines, one per user program and key help. Rows are taken relative to
-    // the cursor, which stays valid if the screen scrolls.
-    let rows = 6 + programs;
+    // lines, the user programs' lines and key help. Rows are taken relative
+    // to the cursor, which stays valid if the screen scrolls.
+    let user_rows = user::lines().len();
+    let rows = 6 + user_rows;
     for _ in 0..rows {
         println!();
     }
@@ -371,11 +384,22 @@ fn interrupt_loop(keyboard: bool, programs: usize) -> ! {
     let mut seen = u64::MAX;
     let mut drawn = u64::MAX;
     let mut errors = keyboard::errors();
+    let mut generation = u64::MAX;
+    let mut focus = if builder { Focus::Builder } else { Focus::Lab };
     status_line(line + 1, format_args!("{}", lab.counter_line()));
     status_line(line + 2, format_args!("{}", lab.adder_line()));
-    help_status(help, keyboard);
+    help_status(help, keyboard, focus, builder);
     loop {
         while let Some(ch) = keyboard::read() {
+            if ch == '\t' && builder {
+                focus = if focus == Focus::Lab { Focus::Builder } else { Focus::Lab };
+                help_status(help, keyboard, focus, builder);
+                continue;
+            }
+            if focus == Focus::Builder {
+                user::send_key(ch);
+                continue;
+            }
             let changed = lab.key(ch);
             if changed.counter {
                 status_line(line + 1, format_args!("{}", lab.counter_line()));
@@ -386,7 +410,13 @@ fn interrupt_loop(keyboard: bool, programs: usize) -> ! {
         }
         if keyboard::errors() != errors {
             errors = keyboard::errors();
-            help_status(help, keyboard);
+            help_status(help, keyboard, focus, builder);
+        }
+        if user::generation() != generation {
+            generation = user::generation();
+            for (i, (name, text)) in user::lines().iter().enumerate() {
+                status_line(line + 5 + i, format_args!("{:<2} {}", name.unwrap_or(""), text));
+            }
         }
 
         let t = irq::ticks();
@@ -396,9 +426,6 @@ fn interrupt_loop(keyboard: bool, programs: usize) -> ! {
                 drawn = t / TASK_REDRAW_TICKS;
                 uptime(line, t / irq::TICK_HZ);
                 task_status(line + 3);
-                for (i, (name, text)) in user::lines().iter().enumerate() {
-                    status_line(line + 5 + i, format_args!("{} {}", name, text));
-                }
             }
             if lab.timer_clock((t / HALF_PERIOD_TICKS) % 2 == 1) {
                 status_line(line + 1, format_args!("{}", lab.counter_line()));
