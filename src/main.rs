@@ -10,6 +10,7 @@ mod exception;
 mod gic;
 mod irq;
 mod mm;
+mod mmu;
 mod nand;
 
 use alloc::boxed::Box;
@@ -117,12 +118,13 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
     init_memory(mmap);
     let gic = report_gic(info.rsdp);
     ok("M2: exceptions and memory");
+    init_mmu(&info.fb, mmap, gic.as_ref());
     nand_demo();
 
     if cfg!(feature = "fault-test") {
-        println!("[test] reading an unmapped address...");
-        let bad = 0xffff_0000_dead_0000usize as *const u64;
-        let _ = unsafe { bad.read_volatile() };
+        println!("[test] dereferencing a null pointer...");
+        let null = core::hint::black_box(core::ptr::null::<u64>());
+        let _ = unsafe { null.read_volatile() };
     }
 
     match gic.as_ref().map(gic::init) {
@@ -273,6 +275,66 @@ fn init_memory(mmap: &impl MemoryMap) {
         panic!("heap self-test failed: {}", s);
     }
     ok("page allocator and heap");
+}
+
+/// Size of a GICv3 distributor's register frame.
+const GICD_SIZE: u64 = 0x1_0000;
+
+fn init_mmu(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::GicInfo>) {
+    let mut m = mmu::Mapper::new();
+
+    // Most specific first: the first mapping of an address wins.
+    if let Some(g) = gic {
+        if let Some(d) = g.gicd {
+            m.map(d, GICD_SIZE, mmu::Kind::Device);
+        }
+        if let Some((base, len)) = g.gicr {
+            m.map(base, len as u64, mmu::Kind::Device);
+        }
+    }
+    let fb_bytes = (fb.stride * fb.height * 4) as u64;
+    m.map(fb.base as u64, fb_bytes, mmu::Kind::Uncached);
+
+    for d in mmap.entries() {
+        let kind = match d.ty {
+            MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE => mmu::Kind::Device,
+            // LOADER_CODE holds our whole PE image, data sections included.
+            MemoryType::LOADER_CODE | MemoryType::RUNTIME_SERVICES_CODE => mmu::Kind::Code,
+            MemoryType::CONVENTIONAL
+            | MemoryType::LOADER_DATA
+            | MemoryType::BOOT_SERVICES_CODE
+            | MemoryType::BOOT_SERVICES_DATA
+            | MemoryType::RUNTIME_SERVICES_DATA
+            | MemoryType::ACPI_RECLAIM
+            | MemoryType::ACPI_NON_VOLATILE
+            | MemoryType::PERSISTENT_MEMORY => mmu::Kind::Data,
+            _ => continue,
+        };
+        m.map(d.phys_start, d.page_count * mm::PAGE_SIZE as u64, kind);
+    }
+
+    let old = mmu::ttbr0();
+    unsafe { m.activate() };
+    let st = m.stats();
+    println!("[mmu ] TTBR0 {:#x} -> {:#x} (ours)", old, mmu::ttbr0());
+    println!(
+        "[mmu ] code {} data {} dev {} fb {} MiB",
+        st.bytes[1] >> 20,
+        st.bytes[0] >> 20,
+        st.bytes[2] >> 20,
+        st.bytes[3] >> 20
+    );
+    println!("[mmu ] {} tables, {} blocks, {} pages", st.tables, st.blocks, st.pages);
+
+    // Check through the MMU itself, without risking a fault.
+    let code = banner as fn() as usize as u64;
+    if mmu::translate(0).is_some() {
+        panic!("page 0 is mapped");
+    }
+    if mmu::translate(code) != Some(code) {
+        panic!("kernel code {:#x} is not identity mapped", code);
+    }
+    ok("M3b: own page tables, null page unmapped");
 }
 
 fn report_gic(rsdp: Option<usize>) -> Option<acpi::GicInfo> {

@@ -2,8 +2,9 @@
 //! register CPU interface. Only PPIs (per-CPU interrupts such as the timer)
 //! are supported for now.
 //!
-//! Addresses come from the ACPI MADT. The firmware leaves the GIC's MMIO
-//! identity mapped as device memory, so registers are accessed directly.
+//! Addresses come from the ACPI MADT. The GIC's MMIO is identity mapped as
+//! device memory (by the firmware, then by `mmu`), so registers are accessed
+//! directly.
 
 use crate::acpi::GicInfo;
 use core::arch::asm;

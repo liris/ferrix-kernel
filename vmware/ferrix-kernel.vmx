@@ -19,3 +19,5 @@ serial0.present = "TRUE"
 serial0.fileType = "file"
 serial0.fileName = "serial.log"
 floppy0.present = "FALSE"
+# Answer VMware dialogs (e.g. "replace serial.log?") so boots never block.
+msg.autoAnswer = "TRUE"

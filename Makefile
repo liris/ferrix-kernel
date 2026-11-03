@@ -44,9 +44,12 @@ run-headless: iso
 		-monitor unix:$(OUT)/mon.sock,server,nowait
 
 # VMware Fusion VM next to the ISO; the template refers to ../$(NAME).iso.
-vm: iso
+vm: iso $(VM_DIR)/$(NAME).vmx
+
+# Re-copied whenever the template changes (VMware may only add keys to it).
+$(VM_DIR)/$(NAME).vmx: $(VMX_TEMPLATE)
 	mkdir -p $(VM_DIR)
-	test -f $(VM_DIR)/$(NAME).vmx || cp $(VMX_TEMPLATE) $(VM_DIR)/$(NAME).vmx
+	cp $(VMX_TEMPLATE) $@
 
 # Always boots the freshly built ISO: a running VM is hard-reset, and a
 # stopped one has any suspended state discarded so it does not resume.
