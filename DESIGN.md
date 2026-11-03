@@ -1,136 +1,139 @@
-# ferrix-kernel 設計ドキュメント
+# ferrix-kernel design
+
+English | [日本語](DESIGN.ja.md)
 
 2026-11-03
 
-## 概要と目標
+## Overview and goals
 
-ferrix-kernel は、Apple Silicon Mac 上の VMware Fusion で起動する、Rust 製の小さな ARM64 カーネルです。UEFI アプリとして起動し、ブートサービス終了後は自前のコードだけで動きます。
+ferrix-kernel is a small ARM64 kernel written in Rust that boots in VMware Fusion on an Apple Silicon Mac. It starts as a UEFI application and, once boot services have ended, runs on its own code only.
 
-**目標**
+**Goals**
 
-- VMware Fusion の ARM64 VM で、ISO から起動して画面に出力する
-- 起動後はファームウェアに頼らず、例外処理・メモリ管理・タイマーを自前で持つ
-- 全コードを Rust で書き、`unsafe` はハードウェアに触れる層に閉じ込める
-- 同じバイナリを QEMU でも動かし、手元で素早く検証できるようにする
+- Boot from an ISO in a VMware Fusion ARM64 VM and draw to the screen
+- After boot, rely on no firmware: own exception handling, memory management and timers
+- Write everything in Rust, confining `unsafe` to the layer that touches hardware
+- Run the same binary in QEMU for fast local iteration
 
-**非目標（当面）**
+**Non-goals (for now)**
 
-- 実機（Mac 本体）での起動
-- x86_64 対応
-- POSIX 互換や既存アプリの実行
-- ネットワーク、ファイルシステム、GUI
+- Booting on real hardware (the Mac itself)
+- x86_64 support
+- POSIX compatibility or running existing applications
+- Networking, file systems, GUI
 
-## ターゲット環境
+## Target environment
 
-ホストが arm64 なので、ゲストは AArch64 + UEFI に固定します（Apple Silicon 版 VMware Fusion は x86 ゲストを動かせません）。
+The host is arm64, so the guest is fixed to AArch64 + UEFI (VMware Fusion on Apple Silicon cannot run x86 guests).
 
-| 項目 | 本番（VMware） | 検証（QEMU） |
+| Item | Production (VMware) | Testing (QEMU) |
 | --- | --- | --- |
-| ホスト | macOS 27.2 / arm64 | 同左 |
-| ハイパーバイザ | VMware Fusion | `qemu-system-aarch64 -M virt` |
-| ファームウェア | VMware 内蔵 UEFI | edk2 `edk2-aarch64-code.fd` |
-| ブート媒体 | ISO（El Torito EFI） | 同じ ISO |
-| 画面 | UEFI GOP フレームバッファ | `ramfb` の GOP |
-| シリアル | 使わない（リスク参照） | PL011 UART（`-serial stdio`） |
+| Host | macOS 27.2 / arm64 | Same |
+| Hypervisor | VMware Fusion | `qemu-system-aarch64 -M virt` |
+| Firmware | VMware's built-in UEFI | edk2 `edk2-aarch64-code.fd` |
+| Boot media | ISO (El Torito EFI) | Same ISO |
+| Display | UEFI GOP framebuffer | GOP on `ramfb` |
+| Serial | Not used (see risks) | PL011 UART (`-serial stdio`) |
 
-M1 で両環境から読み取った実測値（2026-11-03）:
+Values measured in both environments at M1 (2026-11-03):
 
-| 項目 | VMware Fusion | QEMU virt |
+| Item | VMware Fusion | QEMU virt |
 | --- | --- | --- |
-| 画面 | 1024x768, stride 1024 | 800x600, stride 800 |
-| 例外レベル | EL1 | EL1 |
-| MIDR_EL1 | `0x610f0000`（Apple, part 0 = 型番を隠している） | `0x410fd083`（Arm Cortex-A72） |
+| Display | 1024x768, stride 1024 | 800x600, stride 800 |
+| Exception level | EL1 | EL1 |
+| MIDR_EL1 | `0x610f0000` (Apple, part 0 = model hidden) | `0x410fd083` (Arm Cortex-A72) |
 | Generic Timer | 24 MHz | 62.5 MHz |
 | ACPI RSDP | `0x9c060000` | `0x5cb43018` |
-| メモリ | 32 領域, 512 MiB, 使用可能 484 MiB | 33 領域, 576 MiB, 使用可能 478 MiB |
-| GIC（M2 で MADT から取得） | GICv3, GICD `0x2c010000`, GICR `0x2c100000`（`0x20000` = 1 CPU 分）, ITS なし | GICv2, GICD `0x8000000`（`-M virt,gic-version=3` で v3 に変更可） |
+| Memory | 32 regions, 512 MiB, 484 MiB usable | 33 regions, 576 MiB, 478 MiB usable |
+| GIC (from the MADT, M2) | GICv3, GICD `0x2c010000`, GICR `0x2c100000` (`0x20000` = one CPU), no ITS | GICv2, GICD `0x8000000` (v3 with `-M virt,gic-version=3`) |
 
-タイマー周波数と画面サイズが環境で異なるため、どちらもハードコードせず実行時に読む方針で正しいことを確認しました。
+Timer frequency and screen size differ between the environments, which confirms the decision to read both at run time rather than hard-code them.
 
-ツールチェーンは rustc 1.99、ターゲット `aarch64-unknown-uefi`、`uefi` crate 0.41、ISO 作成に xorriso と mtools を使います。
+Toolchain: rustc 1.99, target `aarch64-unknown-uefi`, the `uefi` crate 0.41, and xorriso plus mtools to build the ISO.
 
-## 全体アーキテクチャと起動フロー
+## Architecture and boot flow
 
-ExitBootServices を境に、制御がファームウェアから ferrix-kernel へ移ります。
+`ExitBootServices` is where control passes from the firmware to ferrix-kernel.
 
 ```
-┌─ UEFI フェーズ（ブートサービスあり） ──────────────────────────────────┐
-│ ファームウェア ──▶ efi_main ──▶ 情報収集 ──────────▶ ExitBootServices │
-│ BOOTAA64.EFI     uefi crate   GOP 画面情報          サービス終了       │
-│ を読み込む       で初期化     メモリマップ, ACPI          │            │
+┌─ UEFI phase (boot services available) ─────────────────────────────────┐
+│ firmware ─────▶ efi_main ────▶ collect info ──────▶ ExitBootServices   │
+│ loads           uefi crate     GOP framebuffer      services end       │
+│ BOOTAA64.EFI    init           memory map, ACPI           │            │
 └───────────────────────────────────────────────────────────┼────────────┘
-                     ブートサービス終了後は戻らない          │
-┌─ カーネルフェーズ（自前コードのみ） ───────────────────────▼────────────┐
-│ console ──▶ 例外ベクタ ──▶ メモリ管理 ──▶ GIC + タイマー             │
-│ 8x16 で描画  VBAR_EL1     ページアロケータ  割り込み駆動 → sched       │
+                     no way back after boot services end    │
+┌─ Kernel phase (our code only) ────────────────────────────▼────────────┐
+│ console ──▶ exception ──▶ memory ─────▶ GIC + timer ──▶ tasks          │
+│ 16x16 text  vectors       pages, heap   interrupts      preemptive     │
+│             VBAR_EL1      page tables                   round-robin    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-上段では UEFI のサービスが使えるうちに必要な情報を集め、下段ではその情報だけを頼りに自前で初期化します。
+The upper half gathers what it needs while UEFI services are still available; the lower half initializes everything itself from that information alone.
 
-## カーネル構成要素
+## Kernel components
 
-各要素はファームウェアから受け取った情報（フレームバッファ、メモリマップ、ACPI テーブル）だけを頼りに動き、デバイスのアドレスをハードコードしません。VMware と QEMU の差を吸収するためです。
+Each component works only from what the firmware handed over (framebuffer, memory map, ACPI tables) and hard-codes no device addresses. This is how the differences between VMware and QEMU are absorbed.
 
-| モジュール | 役割 | 実装方針 |
+| Module | Role | Approach |
 | --- | --- | --- |
-| `boot` | UEFI エントリ、情報収集、`ExitBootServices` | `uefi` crate を使用。収集した内容を `BootInfo` にまとめてカーネルに渡す |
-| `console` | フレームバッファ上の文字表示 | 8x8 フォント（font8x8）を 2 倍拡大して 16x16 で描画。`core::fmt::Write` を実装し `println!` を提供 |
-| `arch::exception` | 例外ベクタ（EL1） | 16 エントリのベクタを `global_asm!` で定義し `VBAR_EL1` に設定。ESR/FAR を表示するパニック画面 |
-| `mm` | 物理ページ管理とヒープ | UEFI メモリマップの空き領域から 4KiB ページのビットマップアロケータ。`GlobalAlloc` で `alloc` を有効化 |
-| `arch::timer` | 時間計測 | ARM Generic Timer。経過時間は EL1 仮想タイマー（PPI 27）の 100 Hz 割り込みで数える。GICv3 がない環境ではポーリングに戻る |
-| `gic` / `irq` | 割り込みコントローラと割り込み処理 | ACPI MADT から GICD/GICR を取得し、GICv3 のみ対応（QEMU も `gic-version=3` で揃える）。IRQ ハンドラはタイマー再設定とティック加算を行い、続けてスケジューラにタスク切り替えを任せる。例外入口で FP/SIMD レジスタも退避する |
-| `task` | プリエンプティブなタスク | 各タスクは EL1 で専用スタック（64KiB）を持つ。例外入口が積んだ `TrapFrame` をそのままタスクの保存状態とし、ハンドラが別タスクのフレームを返すと出口がそのスタックに乗り換えて `eret` する。タイマー割り込み（10 ms ごと）と `svc #0`（`yield_now` / `sleep`）で切り替え、ラウンドロビン。実行可能なタスクがなければ `wfi` する idle タスクへ。コンソール・ヒープ・ページアロケータ・タスク表は IRQ を禁止して触る（1 CPU なのでこれがロック） |
-| `mmu` | 自前ページテーブル | 4KiB 粒度・48bit VA の恒等マッピング。1GiB/2MiB ブロックを優先し、残りを 4KiB ページで埋める。重なりは先に張った方が勝つので、GIC → フレームバッファ → MMIO → RAM の順に張る |
-| `nand` | NAND ゲートの回路シミュレータ | 回路をゲートの `Vec` と配線の表で持ち、NAND だけを評価する。M2 の `alloc` に依存し、ハードウェアには触らない（`unsafe` なし） |
+| `main` | UEFI entry, information gathering, `ExitBootServices` | Uses the `uefi` crate. Collected data goes into a `BootInfo` passed to the kernel |
+| `console` | Text on the framebuffer | The 8x8 font8x8 glyphs scaled 2x to 16x16. Implements `core::fmt::Write` and provides `println!` |
+| `exception` | Exception vectors (EL1) | A 16-entry vector table in `global_asm!`, installed in `VBAR_EL1`. Panic screen showing ESR/FAR |
+| `mm` | Physical pages and heap | A bitmap allocator of 4 KiB pages over the free regions in the UEFI memory map. `GlobalAlloc` enables `alloc` |
+| `arch` | System registers and time | ARM Generic Timer. Uptime is counted with 100 Hz interrupts from the EL1 virtual timer (PPI 27); without GICv3 it falls back to polling |
+| `gic` / `irq` | Interrupt controller and dispatch | GICD/GICR come from the ACPI MADT; GICv3 only (QEMU is run with `gic-version=3` to match). The IRQ handler re-arms the timer, counts the tick, then lets the scheduler switch tasks. The exception entry also saves FP/SIMD registers |
+| `task` | Preemptive tasks | Each task runs at EL1 on its own 64 KiB stack. The `TrapFrame` the exception entry pushes is the task's saved state: when the handler returns another task's frame, the exit path switches to that stack and `eret`s. Switches happen on the timer interrupt (every 10 ms) and on `svc #0` (`yield_now` / `sleep`), round-robin; an idle task runs `wfi` when nothing is ready. The console, heap, page allocator and task table are accessed with IRQs masked, which is the lock on one CPU |
+| `mmu` | Our own page tables | Identity map with a 4 KiB granule and 48-bit VA. 1 GiB / 2 MiB blocks where possible, 4 KiB pages for the rest. The first mapping of an address wins, so GIC → framebuffer → MMIO → RAM are mapped in that order |
+| `nand` | Circuit simulator built from NAND gates | A circuit is a `Vec` of gates over numbered wires, and only NAND is evaluated. Depends on `alloc` from M2 and touches no hardware (no `unsafe`) |
 
-メモリ配置は恒等マッピング（仮想 = 物理）のまま、M3b で UEFI のページテーブルから自前のものに切り替えました。必要な領域だけを属性つきで張ります。
+Memory stays identity mapped (virtual = physical), but at M3b the kernel switched from UEFI's page tables to its own, mapping only the regions it needs, each with its own attributes.
 
-| 領域 | 属性 | 実行 |
+| Region | Attributes | Executable |
 | --- | --- | --- |
-| `LOADER_CODE`（カーネルの PE イメージ全体）、ランタイムコード | 通常メモリ（WB キャッシュ） | 可 |
-| その他の RAM（空き、スタック、ACPI、ランタイムデータ） | 通常メモリ（WB キャッシュ） | 不可 |
-| GICD / GICR、メモリマップの MMIO | Device-nGnRE | 不可 |
-| フレームバッファ | 通常メモリ（キャッシュなし） | 不可 |
-| ページ 0 とそれ以外すべて | 未マップ（アクセスで例外） | — |
+| `LOADER_CODE` (the kernel's whole PE image), runtime services code | Normal memory (write-back cacheable) | Yes |
+| Other RAM (free, stacks, ACPI, runtime data) | Normal memory (write-back cacheable) | No |
+| GICD / GICR, MMIO from the memory map | Device-nGnRE | No |
+| Framebuffer | Normal memory (non-cacheable) | No |
+| Page 0 and everything else | Unmapped (access faults) | — |
 
-`LOADER_CODE` にはカーネルのデータセクションも含まれるため、現状は書き込みと実行が両方できます。PE のセクション表を読んでコードとデータの属性を分ける（W^X）のは今後の課題です。
+`LOADER_CODE` also holds the kernel's data sections, so for now that region is both writable and executable. Reading the PE section table to give code and data separate attributes (W^X) is future work.
 
-## ビルドとデプロイ
+## Build and deploy
 
-`make iso` 一つで VMware に渡せる ISO を作り、`make run` で同じ ISO を QEMU で起動します。
+`make iso` builds an ISO ready for VMware, and `make run` boots the same ISO in QEMU.
 
-1. `cargo build --release --target aarch64-unknown-uefi` で `ferrix-kernel.efi` を生成する
-2. mtools で FAT イメージを作り、`EFI/BOOT/BOOTAA64.EFI` として配置する（UEFI の既定ブートパス）
-3. xorriso で FAT イメージを El Torito EFI ブートエントリにした `ferrix-kernel.iso` を作る
-4. 検証: `make run`（QEMU virt + edk2 + ramfb）
-5. 本番: VMware Fusion で「その他の 64 ビット ARM」の VM を作り、CD/DVD に `ferrix-kernel.iso` を割り当てて起動する
+1. `cargo build --release --target aarch64-unknown-uefi` produces `ferrix-kernel.efi`
+2. mtools builds a FAT image with it at `EFI/BOOT/BOOTAA64.EFI` (the UEFI default boot path)
+3. xorriso wraps the FAT image as an El Torito EFI boot entry in `ferrix-kernel.iso`
+4. Testing: `make run` (QEMU virt + edk2 + ramfb)
+5. Production: `make vm-run` assembles a VMware Fusion VM ("Other 64-bit ARM") from `vmware/ferrix-kernel.vmx` with the ISO in its CD/DVD drive, and cold-boots it
 
-VM はメモリ 512MB、1 vCPU、ディスクなしで十分です。
+512 MB of memory, 1 vCPU and no disk are enough for the VM.
 
-## ロードマップ
+## Roadmap
 
-各マイルストーンは「VMware 上で目に見えて動くこと」を完了条件にします。
+A milestone is done when it visibly works on VMware.
 
-- [x] **M0 起動**: UEFI から起動し、GOP 画面に「ferrix-kernel」を表示する（QEMU・VMware とも確認済み）
-- [x] **M1 自立**: `ExitBootServices` 後に自前コンソールでメモリマップと CPU 情報を表示する（QEMU: EL1, Cortex-A72, 576 MiB, uptime 更新）
-- [x] **M2 例外とメモリ**: 例外ベクタで `brk` を捕まえて復帰し、ページアロケータと `Vec` が動く（QEMU・VMware とも確認済み）
-- [x] **M2.5 NAND 回路（組み合わせ）**: NAND だけで NOT / AND / OR / XOR → 半加算器 → 全加算器 → 4bit 加算器を組み、各段の真理値表と加算結果（例: `3 + 5 = 8`）を画面に表示する（QEMU・VMware とも確認済み。NAND 数: NOT 1 / AND 2 / OR 3 / XOR 4 / 半加算器 5 / 全加算器 9 / 4bit 加算器 36。起動時に全 512 通りを検算）
-- [x] **M3 割り込み**: GIC とタイマー割り込みで経過時間を画面に更新し続ける。自前ページテーブルに移行する。デモとして、NAND で組んだ SR ラッチ → D フリップフロップ → 4bit カウンタをタイマー割り込みをクロックにして動かし、値が増えていく様子を表示する
-    - [x] **M3a**: GICv3 + 仮想タイマー割り込み、NAND カウンタ（53 NAND、0.5 秒ごとにクロック反転、立ち上がりで +1 を毎回検算）。QEMU・VMware とも確認済み
-    - [x] **M3b**: 自前ページテーブルへの移行（QEMU・VMware とも確認済み。切り替え後に `at` 命令でページ 0 が未マップ・カーネルコードが恒等マップであることを検査。`make run FEATURES=fault-test` はヌルポインタ参照でパニック画面を出す）
-- [x] **M4 タスク**: 2 つ以上のカーネルタスクをプリエンプティブに切り替える（QEMU・VMware とも確認済み。main / idle / spin / nand / fpu の 5 タスク。作業タスクは自分から譲らない無限ループで、main が CPU を取り戻せること自体がプリエンプションの確認になる。nand は 4bit 加算器の全 512 通り、fpu は浮動小数点の和のビット一致を繰り返し検査し、切り替えでレジスタが壊れないことを確かめる。画面下部に各タスクの CPU 使用率と進み具合を表示）
+- [x] **M0 Boot**: boot from UEFI and show "ferrix-kernel" on the GOP screen (verified on QEMU and VMware)
+- [x] **M1 Self-hosted**: after `ExitBootServices`, show the memory map and CPU information on our own console (QEMU: EL1, Cortex-A72, 576 MiB, uptime updating)
+- [x] **M2 Exceptions and memory**: catch `brk` in the exception vectors and resume; the page allocator and `Vec` work (verified on QEMU and VMware)
+- [x] **M2.5 NAND circuits (combinational)**: build NOT / AND / OR / XOR → half adder → full adder → 4-bit adder from NAND alone, and show each stage's truth table and sums such as `3 + 5 = 8` (verified on QEMU and VMware. NAND counts: NOT 1 / AND 2 / OR 3 / XOR 4 / half adder 5 / full adder 9 / 4-bit adder 36. All 512 inputs are checked at boot)
+- [x] **M3 Interrupts**: keep the uptime on screen updated with the GIC and timer interrupts, and move to our own page tables. As a demo, clock an SR latch → D flip-flop → 4-bit counter built from NAND with the timer interrupt and show the value counting up
+    - [x] **M3a**: GICv3 + virtual timer interrupt, NAND counter (53 NAND, clock toggles every 0.5 s, +1 checked on every rising edge). Verified on QEMU and VMware
+    - [x] **M3b**: move to our own page tables (verified on QEMU and VMware. After the switch, the `at` instruction confirms page 0 is unmapped and kernel code is identity mapped. `make run FEATURES=fault-test` dereferences a null pointer and shows the panic screen)
+- [x] **M4 Tasks**: switch between two or more kernel tasks preemptively (verified on QEMU and VMware. Five tasks: main / idle / spin / nand / fpu. The workers are infinite loops that never yield, so main getting the CPU back at all proves preemption. nand re-checks all 512 inputs of the 4-bit adder and fpu demands a bit-identical floating point sum, round after round, confirming that switches preserve registers. The bottom of the screen shows each task's CPU share and progress)
 
-M4 の先（キーボード入力、ユーザー空間 EL0、capability、キーボードで入力を切り替える対話型の NAND 回路）は M3 完了時に改めて計画します。
+What comes after M4 (keyboard input, user space at EL0, capabilities, an interactive NAND circuit driven from the keyboard) will be planned separately.
 
-## リスクと未決事項
+## Risks and open questions
 
-最大のリスクは、VMware ARM の仮想ハードウェア仕様が公開されておらず、QEMU で動いても VMware で動く保証がないことです。
+The biggest risk is that VMware's ARM virtual hardware is not publicly documented, so working on QEMU does not guarantee working on VMware.
 
-| リスク / 未決事項 | 影響 | 対策 |
+| Risk / open question | Impact | Mitigation |
 | --- | --- | --- |
-| ~~VMware の GIC の種類とアドレスが不明~~ 解決: GICv3 | — | M2 で MADT から取得。QEMU も `gic-version=3` で起動して GICv3 に揃える |
-| VMware にシリアルポートがあるか不明 | 画面以外のデバッグ出力がない | 画面コンソールを主にする。`.vmx` の `serial0` をファイル出力にしたが何も出力されず、起動のたびに上書き確認のダイアログが出るため外した |
-| `ExitBootServices` 後はキーボード入力がなくなる | 対話的なシェルを作れない | M4 までは入力なし。その後 VMware 側の入力デバイス（USB xHCI 等）を調べて判断 |
-| フレームバッファのピクセル形式が環境で異なる | 色が崩れる | GOP の `PixelFormat` を見て RGB / BGR を切り替える |
-| VMware での反復が遅い | 開発速度が落ちる | 日常の検証は QEMU で行い、VMware はマイルストーンごとに確認する |
+| ~~VMware's GIC type and addresses unknown~~ Resolved: GICv3 | — | Read from the MADT at M2. QEMU also runs with `gic-version=3` to match |
+| Unknown whether VMware has a serial port | No debug output besides the screen | The screen console is primary. A `serial0` file output in the `.vmx` produced nothing and raised a "replace or append?" dialog on every boot, so it was removed |
+| No keyboard input after `ExitBootServices` | No interactive shell | No input through M4. Then investigate VMware's input devices (USB xHCI etc.) and decide |
+| Framebuffer pixel format differs between environments | Wrong colours | Switch between RGB and BGR based on GOP's `PixelFormat` |
+| Iterating on VMware is slow | Slower development | Test on QEMU day to day; check on VMware at each milestone |

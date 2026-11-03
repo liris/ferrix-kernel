@@ -1,20 +1,36 @@
 # ferrix-kernel
 
+English | [日本語](README.ja.md)
+
 A tiny AArch64 kernel written in Rust, booting from UEFI on VMware Fusion (Apple Silicon) and QEMU.
 
 It starts as a UEFI application, collects the framebuffer, memory map and ACPI pointer, calls
-`ExitBootServices`, and then runs on its own code only.
+`ExitBootServices`, and then runs on its own code only: exception vectors, a page allocator and
+heap, its own page tables, GICv3 timer interrupts and preemptive round-robin tasks. Alongside, a
+circuit simulator whose only primitive is NAND builds adders and a timer-clocked counter.
+
+Excerpt of a boot on VMware Fusion:
 
 ```
 ferrix-kernel 0.1.0 (aarch64)
 [boot] framebuffer 1024x768 stride=1024
 [ ok ] ExitBootServices: now running on our own
 [cpu ] EL1  MIDR=0x610f0000 (Apple)  part=0x000
-[time] generic timer 24000000 Hz
-[acpi] RSDP at 0x9c060000
-[mem ] 32 regions, 512 MiB total, 484 MiB usable
+[mem ] 31 regions, 512 MiB total, 484 MiB usable
 [ ok ] M1: kernel is self-hosted
-uptime 00:12:55
+[ ok ] M2: exceptions and memory
+[mmu ] TTBR0 0x9ffdf000 -> 0x80380000 (ours)
+[ ok ] M3b: own page tables, null page unmapped
+[nand]  3 +  5 =  8  (0011 + 0101 = 01000)
+[ ok ] M2.5: 4-bit adder 512/512 (36 NAND)
+[ ok ] M3: virtual timer IRQ at 100 Hz
+[ ok ] M4: 5 tasks, round-robin, 10 ms slices
+[ctr ] 4-bit counter, 53 NAND, timer-clocked
+
+uptime 00:00:19
+clk=1  q=0011 ( 3)  edges=20
+cpu  main 0% idle 0% spin 33% nand 33% fpu 33%
+spin 2700804414  nand 159419  fpu 12738948  sw 2594
 ```
 
 ## Requirements
@@ -30,11 +46,14 @@ uptime 00:12:55
 | `make iso` | Build `build/ferrix-kernel.iso` (El Torito EFI, `EFI/BOOT/BOOTAA64.EFI`) |
 | `make run` | Boot the ISO in QEMU (`virt` + edk2 + ramfb) |
 | `make vm` | Assemble a VMware Fusion VM in `build/ferrix-kernel.vmwarevm` |
-| `make vm-run` | Assemble and start that VM |
+| `make vm-run` | Assemble that VM and cold-boot it with the fresh ISO |
+| `make run FEATURES=fault-test` | Boot with a deliberate null dereference to show the panic screen |
 
 ## Design
 
 See [DESIGN.md](DESIGN.md) for goals, boot flow, components and the roadmap.
+
+Documents are written in English; Japanese translations sit next to them as `*.ja.md`.
 
 ## License
 
