@@ -46,6 +46,9 @@ Values measured in both environments at M1 (2026-11-03):
 | ACPI RSDP | `0x9c060000` | `0x5cb43018` |
 | Memory | 32 regions, 512 MiB, 484 MiB usable | 33 regions, 576 MiB, 478 MiB usable |
 | GIC (from the MADT, M2) | GICv3, GICD `0x2c010000`, GICR `0x2c100000` (`0x20000` = one CPU), no ITS | GICv2, GICD `0x8000000` (v3 with `-M virt,gic-version=3`) |
+| PCIe ECAM (from the MCFG, M5) | `0x40000000`, buses 0-255 | `0x4010000000`, buses 0-255 |
+| xHCI (M5) | `15ad:077a` at `01:00.0` (behind a root port), xHCI 1.2, 127 slots, 8 ports | `1b36:000d` at `00:02.0`, xHCI 1.0, 64 slots, 8 ports |
+| USB devices on root ports (M5) | 5: `0e0f:0003` HID (pointer), 6: `0e0f:0006` keyboard (full speed), 7/8: `0e0f:0002` hubs | 5: `0627:0001` keyboard (high speed) |
 
 Timer frequency and screen size differ between the environments, which confirms the decision to read both at run time rather than hard-code them.
 
@@ -84,7 +87,10 @@ Each component works only from what the firmware handed over (framebuffer, memor
 | `arch` | System registers and time | ARM Generic Timer. Uptime is counted with 100 Hz interrupts from the EL1 virtual timer (PPI 27); without GICv3 it falls back to polling |
 | `gic` / `irq` | Interrupt controller and dispatch | GICD/GICR come from the ACPI MADT; GICv3 only (QEMU is run with `gic-version=3` to match). The IRQ handler re-arms the timer, counts the tick, then lets the scheduler switch tasks. The exception entry also saves FP/SIMD registers |
 | `task` | Preemptive tasks | Each task runs at EL1 on its own 64 KiB stack. The `TrapFrame` the exception entry pushes is the task's saved state: when the handler returns another task's frame, the exit path switches to that stack and `eret`s. Switches happen on the timer interrupt (every 10 ms) and on `svc #0` (`yield_now` / `sleep`), round-robin; an idle task runs `wfi` when nothing is ready. The console, heap, page allocator and task table are accessed with IRQs masked, which is the lock on one CPU |
-| `mmu` | Our own page tables | Identity map with a 4 KiB granule and 48-bit VA. 1 GiB / 2 MiB blocks where possible, 4 KiB pages for the rest. The first mapping of an address wins, so GIC → framebuffer → MMIO → RAM are mapped in that order |
+| `mmu` | Our own page tables | Identity map with a 4 KiB granule and 48-bit VA. 1 GiB / 2 MiB blocks where possible, 4 KiB pages for the rest. The first mapping of an address wins, so GIC → framebuffer → MMIO → RAM are mapped in that order. Regions found later (PCIe ECAM, BARs) are added to the live tables with `map_live`; it only fills invalid entries, so no TLB invalidation is needed |
+| `pci` | PCIe configuration space | ECAM base from the ACPI MCFG. A flat scan over the bus range finds functions behind bridges too, because the firmware already numbered the buses and assigned BARs. Config space and BARs are mapped as device memory on first use |
+| `xhci` | USB host controller | Taken over from the firmware (legacy handoff), halted and reset. Command, event and transfer rings in identity-mapped RAM; the event ring is polled, no interrupts. Root port reset, Enable Slot / Address Device / Evaluate Context / Configure Endpoint, control transfers and interrupt IN transfers |
+| `usb` / `keyboard` | Devices and the keyboard | Every connected root port is enumerated and its device named from its descriptors. The first HID boot keyboard is switched to the boot protocol; a `kbd` task keeps one 8-byte report request queued and checks it every tick. `keyboard` turns newly pressed keys into characters (US layout) and queues them for `main`, which echoes them on the bottom line. Hubs are not supported yet |
 | `nand` | Circuit simulator built from NAND gates | A circuit is a `Vec` of gates over numbered wires, and only NAND is evaluated. Depends on `alloc` from M2 and touches no hardware (no `unsafe`) |
 
 Memory stays identity mapped (virtual = physical), but at M3b the kernel switched from UEFI's page tables to its own, mapping only the regions it needs, each with its own attributes.
@@ -93,7 +99,7 @@ Memory stays identity mapped (virtual = physical), but at M3b the kernel switche
 | --- | --- | --- |
 | `LOADER_CODE` (the kernel's whole PE image), runtime services code | Normal memory (write-back cacheable) | Yes |
 | Other RAM (free, stacks, ACPI, runtime data) | Normal memory (write-back cacheable) | No |
-| GICD / GICR, MMIO from the memory map | Device-nGnRE | No |
+| GICD / GICR, MMIO from the memory map, PCIe ECAM and BARs | Device-nGnRE | No |
 | Framebuffer | Normal memory (non-cacheable) | No |
 | Page 0 and everything else | Unmapped (access faults) | — |
 
@@ -124,7 +130,13 @@ A milestone is done when it visibly works on VMware.
     - [x] **M3b**: move to our own page tables (verified on QEMU and VMware. After the switch, the `at` instruction confirms page 0 is unmapped and kernel code is identity mapped. `make run FEATURES=fault-test` dereferences a null pointer and shows the panic screen)
 - [x] **M4 Tasks**: switch between two or more kernel tasks preemptively (verified on QEMU and VMware. Five tasks: main / idle / spin / nand / fpu. The workers are infinite loops that never yield, so main getting the CPU back at all proves preemption. nand re-checks all 512 inputs of the 4-bit adder and fpu demands a bit-identical floating point sum, round after round, confirming that switches preserve registers. The bottom of the screen shows each task's CPU share and progress)
 
-What comes after M4 (keyboard input, user space at EL0, capabilities, an interactive NAND circuit driven from the keyboard) will be planned separately.
+- [x] **M5 Keyboard input**: type on a USB keyboard through our own xHCI driver and see the characters echoed on the bottom line while the demos keep running (verified on QEMU and VMware)
+    - [x] **M5a**: find the xHCI controller over PCIe (ACPI MCFG → ECAM) and take it over from the firmware, then reset it
+    - [x] **M5b**: enumerate the devices on the root ports and configure the boot protocol keyboard (VMware: keyboard, pointer and two hubs on ports 5-8; QEMU: keyboard on port 5)
+    - [x] **M5c**: poll interrupt IN reports from a `kbd` task and turn them into characters; Enter clears the line, Backspace deletes
+- [ ] **M6 Interactive NAND circuit**: drive a NAND circuit from the keyboard (toggle inputs, step the clock by hand)
+- [ ] **M7 User space**: run code at EL0
+- [ ] **M8 Capabilities**
 
 ## Risks and open questions
 
@@ -134,6 +146,7 @@ The biggest risk is that VMware's ARM virtual hardware is not publicly documente
 | --- | --- | --- |
 | ~~VMware's GIC type and addresses unknown~~ Resolved: GICv3 | — | Read from the MADT at M2. QEMU also runs with `gic-version=3` to match |
 | Unknown whether VMware has a serial port | No debug output besides the screen | The screen console is primary. A `serial0` file output in the `.vmx` produced nothing and raised a "replace or append?" dialog on every boot, so it was removed |
-| No keyboard input after `ExitBootServices` | No interactive shell | No input through M4. Then investigate VMware's input devices (USB xHCI etc.) and decide |
+| ~~No keyboard input after `ExitBootServices`~~ Resolved: USB keyboard behind xHCI | — | M5: own xHCI and HID boot keyboard driver, the same on VMware and QEMU |
+| Devices behind a USB hub are not seen | A keyboard plugged into a hub would not work | VMware puts its keyboard on a root port, so not needed yet; hub support when something needs it |
 | Framebuffer pixel format differs between environments | Wrong colours | Switch between RGB and BGR based on GOP's `PixelFormat` |
 | Iterating on VMware is slow | Slower development | Test on QEMU day to day; check on VMware at each milestone |

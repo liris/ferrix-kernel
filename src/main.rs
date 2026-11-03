@@ -9,10 +9,14 @@ mod console;
 mod exception;
 mod gic;
 mod irq;
+mod keyboard;
 mod mm;
 mod mmu;
 mod nand;
+mod pci;
 mod task;
+mod usb;
+mod xhci;
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -135,7 +139,8 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
             irq::start_timer(freq);
             ok(format_args!("M3: virtual timer IRQ at {} Hz", irq::TICK_HZ));
             start_tasks();
-            interrupt_loop()
+            let keyboard = init_usb(info.rsdp);
+            interrupt_loop(keyboard)
         }
         Some(Err(e)) => println!("[gic ] {}", e),
         None => println!("[gic ] not found"),
@@ -232,13 +237,89 @@ fn start_tasks() {
     ok(format_args!("M4: {} tasks, round-robin, {} ms slices", tasks.len(), 1000 / irq::TICK_HZ));
 }
 
+/// PCI class code of an xHCI controller: serial bus, USB, xHCI.
+const CLASS_XHCI: [u8; 3] = [0x0c, 0x03, 0x30];
+
+/// Finds the xHCI controller and sets up USB. Returns whether a keyboard
+/// was found.
+fn init_usb(rsdp: Option<usize>) -> bool {
+    let ecam = match rsdp.map(acpi::find_ecam) {
+        Some(Ok(e)) => e,
+        Some(Err(e)) => {
+            println!("[pci ] MCFG: {}", e);
+            return false;
+        }
+        None => {
+            println!("[pci ] no ACPI, no PCIe");
+            return false;
+        }
+    };
+    println!(
+        "[pci ] ECAM {:#x} seg {} bus {}-{}",
+        ecam.base, ecam.segment, ecam.bus_start, ecam.bus_end
+    );
+    let Some(f) = pci::find_class(&ecam, CLASS_XHCI) else {
+        println!("[pci ] no xHCI controller");
+        return false;
+    };
+    let (vendor, device) = f.ids();
+    println!(
+        "[pci ] {:02x}:{:02x}.{} xHCI {:04x}:{:04x}",
+        f.bus, f.device, f.function, vendor, device
+    );
+    let hc = match xhci::Xhci::init(&f) {
+        Ok(hc) => hc,
+        Err(e) => {
+            println!("[xhci] {}", e);
+            return false;
+        }
+    };
+    println!(
+        "[xhci] v{:x}.{:02x} slots {} ports {}, running",
+        hc.version >> 8,
+        hc.version & 0xff,
+        hc.max_slots,
+        hc.max_ports
+    );
+    let found = usb::init(hc);
+    if found {
+        ok("M5: USB keyboard ready, type away");
+    } else {
+        println!("[usb ] no keyboard");
+    }
+    found
+}
+
+/// Longest input line kept; with the prompt it fits 48 columns.
+const INPUT_MAX: usize = 40;
+
+/// The input line: what has been typed since the last Enter.
+fn input_status(line: usize, keyboard: bool, text: &str) {
+    if !keyboard {
+        return status_line(line, format_args!("key> (no keyboard)"));
+    }
+    let errors = keyboard::errors();
+    console::with(|c| {
+        c.goto_line(line);
+        c.set_color(ACCENT);
+    });
+    print!("key> ");
+    console::with(|c| c.set_color(FG));
+    print!("{}_", text);
+    if errors > 0 {
+        console::with(|c| c.set_color(ERR));
+        print!(" err {}", errors);
+        console::with(|c| c.set_color(FG));
+    }
+}
+
 /// Task lines: CPU share per task (ticks it was running for), then progress.
 fn task_status(line: usize) {
     let (tasks, switches) = task::snapshot();
     let total = tasks.iter().map(|t| t.ticks).sum::<u64>().max(1);
-    let mut cpu = String::from("cpu ");
+    let mut cpu = String::from("cpu%");
     for t in &tasks {
-        cpu += &format!(" {} {}%", t.name, t.ticks * 100 / total);
+        cpu += &format!(" {} {}", t.name, t.ticks * 100 / total);
     }
     status_line(line, format_args!("{}", cpu));
     status_line(
@@ -263,29 +344,50 @@ fn counter_status(line: usize, level: bool, value: u64, edges: u64) {
 /// Ticks between redraws of the task lines (10 per second).
 const TASK_REDRAW_TICKS: u64 = irq::TICK_HZ / 10;
 
-/// The `main` task: sleep a tick at a time; redraw the uptime and task lines
-/// and drive the NAND counter's clock from the tick count.
-fn interrupt_loop() -> ! {
+/// The `main` task: sleep a tick at a time; redraw the uptime and task lines,
+/// drive the NAND counter's clock from the tick count, and echo typed keys.
+fn interrupt_loop(keyboard: bool) -> ! {
     let mut c = Circuit::new();
     let (clk, one) = (c.input(), c.input());
     c.set(one, true);
     let q = c.counter::<4>(clk, one);
     c.eval().expect("counter did not settle");
     println!("[ctr ] 4-bit counter, {} NAND, timer-clocked", c.gate_count());
-    // Reserve a blank spacer, then rows for uptime, counter and two task
-    // lines. Rows are taken relative to the cursor, which stays valid if the
-    // screen scrolls.
-    for _ in 0..4 {
+    // Reserve a blank spacer, then rows for uptime, counter, two task lines
+    // and input. Rows are taken relative to the cursor, which stays valid if
+    // the screen scrolls.
+    for _ in 0..5 {
         println!();
     }
-    let line = console::with(|c| c.row()).unwrap_or(3) - 3;
+    let line = console::with(|c| c.row()).unwrap_or(4) - 4;
     let mut seen = u64::MAX;
     let mut drawn = u64::MAX;
     let mut level = false;
     let mut edges = 0u64;
     let mut value = c.get_bits(&q);
     counter_status(line + 1, level, value, edges);
+    let mut input = String::new();
+    let mut errors = keyboard::errors();
+    input_status(line + 4, keyboard, &input);
     loop {
+        let mut typed = false;
+        while let Some(ch) = keyboard::read() {
+            typed = true;
+            match ch {
+                '\n' => input.clear(),
+                '\x08' => {
+                    input.pop();
+                }
+                '\t' => {}
+                _ if input.len() < INPUT_MAX => input.push(ch),
+                _ => {}
+            }
+        }
+        if typed || keyboard::errors() != errors {
+            errors = keyboard::errors();
+            input_status(line + 4, keyboard, &input);
+        }
+
         let t = irq::ticks();
         if t != seen {
             seen = t;
@@ -408,8 +510,8 @@ fn init_mmu(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::GicInfo>
     }
 
     let old = mmu::ttbr0();
-    unsafe { m.activate() };
     let st = m.stats();
+    unsafe { m.activate() };
     println!("[mmu ] TTBR0 {:#x} -> {:#x} (ours)", old, mmu::ttbr0());
     println!(
         "[mmu ] code {} data {} dev {} fb {} MiB",

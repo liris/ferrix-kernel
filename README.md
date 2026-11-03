@@ -6,8 +6,9 @@ A tiny AArch64 kernel written in Rust, booting from UEFI on VMware Fusion (Apple
 
 It starts as a UEFI application, collects the framebuffer, memory map and ACPI pointer, calls
 `ExitBootServices`, and then runs on its own code only: exception vectors, a page allocator and
-heap, its own page tables, GICv3 timer interrupts and preemptive round-robin tasks. Alongside, a
-circuit simulator whose only primitive is NAND builds adders and a timer-clocked counter.
+heap, its own page tables, GICv3 timer interrupts, preemptive round-robin tasks, and a USB keyboard
+through its own xHCI driver. Alongside, a circuit simulator whose only primitive is NAND builds
+adders and a timer-clocked counter.
 
 Excerpt of a boot on VMware Fusion:
 
@@ -25,12 +26,16 @@ ferrix-kernel 0.1.0 (aarch64)
 [ ok ] M2.5: 4-bit adder 512/512 (36 NAND)
 [ ok ] M3: virtual timer IRQ at 100 Hz
 [ ok ] M4: 5 tasks, round-robin, 10 ms slices
+[pci ] 01:00.0 xHCI 15ad:077a
+[usb ] port 6 full 0e0f:0006 keyboard
+[ ok ] M5: USB keyboard ready, type away
 [ctr ] 4-bit counter, 53 NAND, timer-clocked
 
-uptime 00:00:19
-clk=1  q=0011 ( 3)  edges=20
-cpu  main 0% idle 0% spin 33% nand 33% fpu 33%
-spin 2700804414  nand 159419  fpu 12738948  sw 2594
+uptime 00:01:30
+clk=1  q=1010 (10)  edges=91
+cpu% main 0 idle 0 spin 33 nand 33 fpu 33 kbd 0
+spin 14066695545  nand 875742  fpu 68638483  sw 15068
+key> keyboard typing test_
 ```
 
 ## Requirements

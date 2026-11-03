@@ -10,9 +10,14 @@
 //! mapped with the largest block that fits (1 GiB, 2 MiB) and 4 KiB pages
 //! elsewhere. When two requests overlap, the first one wins, so the more
 //! specific mappings (GIC, framebuffer) are made before plain RAM.
+//!
+//! Once active, the tables stay owned by this module, and `map_live` can add
+//! regions found later (PCIe config space and BARs). Only invalid entries are
+//! filled in then, so no TLB entry can be stale and no invalidation is needed.
 
 use crate::mm::{self, PAGE_SIZE};
 use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::ptr;
 
 const ENTRIES: usize = 512;
@@ -139,12 +144,13 @@ impl Mapper {
         mapped
     }
 
-    /// Switches TTBR0_EL1 to these tables. Interrupts must be masked.
+    /// Switches TTBR0_EL1 to these tables and keeps them for `map_live`.
+    /// Interrupts must be masked.
     ///
     /// # Safety
     /// Everything the kernel touches from now on (code, stack, heap, page
     /// tables, framebuffer, MMIO) must be mapped.
-    pub unsafe fn activate(&self) {
+    pub unsafe fn activate(self) {
         let pa_range = read_sysreg_mmfr0() & 0xf;
         // IPS uses the same encoding as PARange; our descriptors hold 48 bits.
         let ips = pa_range.min(5);
@@ -173,8 +179,25 @@ impl Mapper {
                 ttbr = in(reg) self.root as u64,
                 options(nostack),
             );
+            *ACTIVE.0.get() = Some(self);
         }
     }
+}
+
+struct Global(UnsafeCell<Option<Mapper>>);
+unsafe impl Sync for Global {}
+
+static ACTIVE: Global = Global(UnsafeCell::new(None));
+
+/// Maps another region into the active tables. Like `Mapper::map`, parts
+/// that are already mapped keep their mapping.
+pub fn map_live(start: u64, len: u64, kind: Kind) {
+    crate::arch::without_irqs(|| {
+        let m = unsafe { (*ACTIVE.0.get()).as_mut() }.expect("page tables not active");
+        m.map(start, len, kind);
+        // The new entries must be visible to the walker before any access.
+        unsafe { asm!("dsb ishst", "isb", options(nostack)) };
+    });
 }
 
 fn read_sysreg_mmfr0() -> u64 {

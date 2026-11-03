@@ -1,4 +1,5 @@
-//! Minimal ACPI walk: RSDP -> XSDT -> MADT, to find the GIC.
+//! Minimal ACPI walk: RSDP -> XSDT -> MADT to find the GIC, and -> MCFG to
+//! find PCIe configuration space.
 //!
 //! The firmware leaves ACPI tables identity mapped, so physical addresses are
 //! dereferenced directly. Tables are read with unaligned loads.
@@ -82,4 +83,30 @@ pub fn find_gic(rsdp: usize) -> Result<GicInfo, &'static str> {
         }
     }
     Ok(info)
+}
+
+/// PCIe enhanced configuration space (ECAM) of one segment.
+pub struct Ecam {
+    pub base: u64,
+    pub segment: u16,
+    pub bus_start: u8,
+    pub bus_end: u8,
+}
+
+/// The first ECAM window listed in the MCFG.
+pub fn find_ecam(rsdp: usize) -> Result<Ecam, &'static str> {
+    let mcfg = find_table(rsdp, b"MCFG")?;
+    unsafe {
+        // Allocation entries start after 8 reserved bytes, 16 bytes each.
+        let first = SDT_HEADER_LEN + 8;
+        if (u32_at(mcfg, 4) as usize) < first + 16 {
+            return Err("MCFG has no entries");
+        }
+        Ok(Ecam {
+            base: u64_at(mcfg, first),
+            segment: read_unaligned((mcfg + first + 8) as *const u16),
+            bus_start: u8_at(mcfg, first + 10),
+            bus_end: u8_at(mcfg, first + 11),
+        })
+    }
 }
