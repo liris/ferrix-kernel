@@ -8,10 +8,13 @@ mod arch;
 mod console;
 mod exception;
 mod mm;
+mod nand;
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
+use nand::{Circuit, Wire};
 use console::{ACCENT, DIM, ERR, FG, Format, Framebuffer, OK};
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
@@ -112,6 +115,7 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
     init_memory(mmap);
     report_gic(info.rsdp);
     ok("M2: exceptions and memory");
+    nand_demo();
 
     if cfg!(feature = "fault-test") {
         println!("[test] reading an unmapped address...");
@@ -214,6 +218,105 @@ fn report_gic(rsdp: Option<usize>) {
         }
         Err(e) => println!("[gic ] MADT: {}", e),
     }
+}
+
+/// Prints the truth table of a small NAND circuit and checks every row.
+///
+/// Inputs are listed MSB first (`ab`), outputs in the order `build` returns
+/// them; `expect` maps the input bits to the expected output bits.
+fn truth_table(
+    name: &str,
+    n_inputs: usize,
+    build: impl Fn(&mut Circuit, &[Wire]) -> Vec<Wire>,
+    expect: impl Fn(&[bool]) -> Vec<bool>,
+) {
+    let mut c = Circuit::new();
+    let ins: Vec<Wire> = (0..n_inputs).map(|_| c.input()).collect();
+    let outs = build(&mut c, &ins);
+    let bit = |b: bool| if b { '1' } else { '0' };
+
+    let mut rows = Vec::new();
+    for combo in 0..1u32 << n_inputs {
+        let bits: Vec<bool> = (0..n_inputs).map(|k| combo >> (n_inputs - 1 - k) & 1 == 1).collect();
+        for (&w, &v) in ins.iter().zip(&bits) {
+            c.set(w, v);
+        }
+        c.eval().expect("combinational circuit did not settle");
+        let got: Vec<bool> = outs.iter().map(|&w| c.get(w)).collect();
+        if got != expect(&bits) {
+            panic!("{} is wrong for inputs {:?}", name, bits);
+        }
+        let mut row: String = bits.iter().map(|&b| bit(b)).collect();
+        row.push('>');
+        row.extend(got.iter().map(|&b| bit(b)));
+        rows.push(row);
+    }
+
+    for (i, chunk) in rows.chunks(4).enumerate() {
+        let label = if i == 0 { name } else { "" };
+        let cells = chunk.join(" ");
+        if i == 0 {
+            println!("[nand] {:<4} {}  {} NAND", label, cells, c.gate_count());
+        } else {
+            println!("       {:<4} {}", label, cells);
+        }
+    }
+}
+
+fn nand_demo() {
+    truth_table("NOT", 1, |c, i| [c.not(i[0])].into(), |b| [!b[0]].into());
+    truth_table("AND", 2, |c, i| [c.and(i[0], i[1])].into(), |b| [b[0] & b[1]].into());
+    truth_table("OR", 2, |c, i| [c.or(i[0], i[1])].into(), |b| [b[0] | b[1]].into());
+    truth_table("XOR", 2, |c, i| [c.xor(i[0], i[1])].into(), |b| [b[0] ^ b[1]].into());
+    truth_table(
+        "HA",
+        2,
+        |c, i| {
+            let (s, carry) = c.half_adder(i[0], i[1]);
+            [s, carry].into()
+        },
+        |b| [b[0] ^ b[1], b[0] & b[1]].into(),
+    );
+    truth_table(
+        "FA",
+        3,
+        |c, i| {
+            let (s, carry) = c.full_adder(i[0], i[1], i[2]);
+            [s, carry].into()
+        },
+        |b| {
+            let n = b.iter().filter(|&&x| x).count();
+            [n & 1 == 1, n >= 2].into()
+        },
+    );
+
+    // 4-bit ripple-carry adder: show a few sums, then check every input.
+    let mut c = Circuit::new();
+    let (a, b, cin) = (c.inputs::<4>(), c.inputs::<4>(), c.input());
+    let (sum, cout) = c.adder(a, b, cin);
+    let mut add = |x: u64, y: u64, carry_in: bool| {
+        c.set_bits(&a, x);
+        c.set_bits(&b, y);
+        c.set(cin, carry_in);
+        c.eval().expect("adder did not settle");
+        c.get_bits(&sum) | (c.get(cout) as u64) << 4
+    };
+    for (x, y) in [(3, 5), (7, 8), (9, 9), (15, 15)] {
+        let r = add(x, y, false);
+        println!("[nand] {:2} + {:2} = {:2}  ({:04b} + {:04b} = {:05b})", x, y, r, x, y, r);
+    }
+    for x in 0..16 {
+        for y in 0..16 {
+            for carry_in in [false, true] {
+                let r = add(x, y, carry_in);
+                if r != x + y + carry_in as u64 {
+                    panic!("4-bit adder: {} + {} + {} gave {}", x, y, carry_in as u8, r);
+                }
+            }
+        }
+    }
+    let gates = c.gate_count();
+    ok(format_args!("M2.5: 4-bit adder 512/512 ({} NAND)", gates));
 }
 
 fn banner() {
