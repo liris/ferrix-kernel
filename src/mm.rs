@@ -8,7 +8,7 @@
 //! coalescing neighbours on free. It grows by taking pages from the page
 //! allocator; pages are never returned.
 //!
-//! Single core and interrupts masked, so no locking yet (revisit at M3).
+//! Single core: both are shared with preemptible tasks by masking IRQs.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -98,8 +98,10 @@ static PAGES: Global<PageAllocator> = Global(UnsafeCell::new(None));
 
 /// Runs `f` with the page allocator. Panics before `init`.
 pub fn pages<R>(f: impl FnOnce(&mut PageAllocator) -> R) -> R {
-    let pa = unsafe { (*PAGES.0.get()).as_mut() }.expect("page allocator not initialized");
-    f(pa)
+    crate::arch::without_irqs(|| {
+        let pa = unsafe { (*PAGES.0.get()).as_mut() }.expect("page allocator not initialized");
+        f(pa)
+    })
 }
 
 pub fn init(mmap: &impl MemoryMap) {
@@ -255,17 +257,17 @@ unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = block_size(&layout);
         let align = layout.align().max(ALIGN);
-        unsafe {
+        crate::arch::without_irqs(|| unsafe {
             let p = self.take(size, align);
             if !p.is_null() || !self.grow(size, align) {
                 return p;
             }
             self.take(size, align)
-        }
+        })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.insert(ptr as usize, block_size(&layout)) };
+        crate::arch::without_irqs(|| unsafe { self.insert(ptr as usize, block_size(&layout)) });
     }
 }
 

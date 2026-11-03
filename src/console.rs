@@ -168,8 +168,8 @@ impl fmt::Write for Console {
     }
 }
 
-/// Global console. ferrix-kernel runs on a single core with interrupts off,
-/// so unsynchronized access is sound for now; revisit at M3 (interrupts).
+/// Global console, shared between tasks. Single core: `with` masks IRQs so
+/// no switch can happen in the middle of a draw.
 struct Global(UnsafeCell<Option<Console>>);
 unsafe impl Sync for Global {}
 
@@ -181,7 +181,7 @@ pub fn init(fb: Framebuffer) {
 
 /// Runs `f` with the console, if one has been initialized.
 pub fn with<R>(f: impl FnOnce(&mut Console) -> R) -> Option<R> {
-    unsafe { (*CONSOLE.0.get()).as_mut().map(f) }
+    crate::arch::without_irqs(|| unsafe { (*CONSOLE.0.get()).as_mut().map(f) })
 }
 
 #[doc(hidden)]

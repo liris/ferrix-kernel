@@ -44,24 +44,27 @@ run-headless: iso
 		-monitor unix:$(OUT)/mon.sock,server,nowait
 
 # VMware Fusion VM next to the ISO; the template refers to ../$(NAME).iso.
-vm: iso $(VM_DIR)/$(NAME).vmx
+vm: iso $(VM_DIR)/template.vmx
 
-# Re-copied whenever the template changes (VMware may only add keys to it).
-$(VM_DIR)/$(NAME).vmx: $(VMX_TEMPLATE)
+# VMware rewrites the VM's .vmx on every boot, so its timestamp says nothing;
+# a pristine copy of the template marks which version was installed.
+$(VM_DIR)/template.vmx: $(VMX_TEMPLATE)
 	mkdir -p $(VM_DIR)
+	cp $(VMX_TEMPLATE) $(VM_DIR)/$(NAME).vmx
 	cp $(VMX_TEMPLATE) $@
 
-# Always boots the freshly built ISO: a running VM is hard-reset, and a
-# stopped one has any suspended state discarded so it does not resume.
+# Always cold-boots the freshly built ISO: a running VM is powered off first
+# (so template changes to the .vmx take effect), and suspended state is
+# discarded so it does not resume.
 VMX := $(abspath $(VM_DIR)/$(NAME).vmx)
 
-vm-run: vm
+vm-run: iso
 	if $(VMRUN) list | grep -qF "$(VMX)"; then \
-		$(VMRUN) -T fusion reset "$(VMX)" hard; \
-	else \
-		rm -f $(VM_DIR)/*.vmss $(VM_DIR)/*.vmem; \
-		$(VMRUN) -T fusion start "$(VMX)" gui; \
+		$(VMRUN) -T fusion stop "$(VMX)" hard; \
 	fi
+	$(MAKE) -s vm
+	rm -f $(VM_DIR)/*.vmss $(VM_DIR)/*.vmem $(VM_DIR)/serial.log
+	$(VMRUN) -T fusion start "$(VMX)" gui
 
 clean:
 	cargo clean

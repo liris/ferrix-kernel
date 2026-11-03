@@ -50,6 +50,22 @@ pub fn enable_irqs() {
     unsafe { asm!("msr daifclr, #2", options(nomem, nostack)) };
 }
 
+/// Runs `f` with IRQs masked, then restores the previous mask. On one CPU
+/// this is the lock around state shared with the IRQ handler and other tasks.
+pub fn without_irqs<R>(f: impl FnOnce() -> R) -> R {
+    let daif = read_sysreg!("DAIF");
+    // Not `nomem`: memory accesses in `f` must stay inside the masked region.
+    unsafe { asm!("msr daifset, #2", options(nostack)) };
+    let r = f();
+    unsafe { asm!("msr daif, {}", in(reg) daif, options(nostack)) };
+    r
+}
+
+/// Masks IRQs and FIQs for good (panic).
+pub fn disable_irqs() {
+    unsafe { asm!("msr daifset, #3", options(nostack)) };
+}
+
 /// Sleeps until an interrupt (or other event) arrives.
 pub fn wait_for_interrupt() {
     unsafe { asm!("wfi", options(nomem, nostack)) };

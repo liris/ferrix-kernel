@@ -1,15 +1,16 @@
 //! Interrupt dispatch and the periodic timer tick.
 //!
-//! The IRQ handler only re-arms the timer and bumps `TICKS`. Everything that
-//! touches the console or the heap stays in the main loop, which sleeps with
-//! `wfi` and reacts to the tick count, so no locks are needed yet.
+//! The IRQ handler re-arms the timer and bumps `TICKS`; the exception path
+//! then lets the scheduler switch tasks. Drawing and NAND evaluation stay in
+//! tasks, which share the console and heap by masking IRQs around them.
 
 use crate::{arch, gic};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// EL1 virtual timer PPI.
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
-pub const TICK_HZ: u64 = 10;
+/// Also the scheduler's time slice: 10 ms.
+pub const TICK_HZ: u64 = 100;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static RELOAD: AtomicU64 = AtomicU64::new(0);
@@ -27,11 +28,12 @@ pub fn start_timer(timer_freq: u64) {
     arch::enable_irqs();
 }
 
-/// Called from the exception vector for IRQs taken at EL1.
-pub fn handle() {
+/// Called from the exception vector for IRQs taken at EL1. Returns whether
+/// the timer ticked.
+pub fn handle() -> bool {
     let intid = gic::acknowledge();
     match intid {
-        gic::SPURIOUS => return,
+        gic::SPURIOUS => return false,
         VIRTUAL_TIMER_INTID => {
             arch::virtual_timer_arm(RELOAD.load(Ordering::Relaxed));
             TICKS.fetch_add(1, Ordering::Relaxed);
@@ -39,4 +41,5 @@ pub fn handle() {
         _ => panic!("unexpected interrupt INTID {}", intid),
     }
     gic::end_of_interrupt(intid);
+    true
 }

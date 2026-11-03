@@ -12,11 +12,13 @@ mod irq;
 mod mm;
 mod mmu;
 mod nand;
+mod task;
 
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use nand::{Circuit, Wire};
 use console::{ACCENT, DIM, ERR, FG, Format, Framebuffer, OK};
 use uefi::boot::{self, MemoryType};
@@ -132,6 +134,7 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
             println!("[gic ] GICv3 up, redistributor at {:#x}", rd);
             irq::start_timer(freq);
             ok(format_args!("M3: virtual timer IRQ at {} Hz", irq::TICK_HZ));
+            start_tasks();
             interrupt_loop()
         }
         Some(Err(e)) => println!("[gic ] {}", e),
@@ -171,11 +174,97 @@ fn polling_loop(freq: u64) -> ! {
     }
 }
 
-/// Timer ticks per half clock period of the NAND counter (0.5 s at 10 Hz).
-const HALF_PERIOD_TICKS: u64 = 5;
+/// Timer ticks per half clock period of the NAND counter (0.5 s).
+const HALF_PERIOD_TICKS: u64 = irq::TICK_HZ / 2;
 
-/// With interrupts: sleep in `wfi`; on each tick redraw the uptime and drive
-/// the NAND counter's clock from the tick count.
+// Progress of the worker tasks, read by `main` for display.
+static SPIN_COUNT: AtomicU64 = AtomicU64::new(0);
+static NAND_ROUNDS: AtomicU64 = AtomicU64::new(0);
+static FPU_ROUNDS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts as fast as it can and never yields: it only stops running because
+/// the timer preempts it.
+fn spin_task() {
+    loop {
+        SPIN_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Checks the NAND 4-bit adder on all 512 inputs, over and over. A register
+/// lost across a switch would show up as a wrong sum.
+fn nand_task() {
+    let mut adder = Adder4::new();
+    loop {
+        adder.check_all();
+        NAND_ROUNDS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Repeats a floating point sum and demands a bit-identical result each
+/// time, so FP/SIMD registers must survive every switch.
+fn fpu_task() {
+    let sum = || (1..=1000).map(|k| 1.0 / (k * k) as f64).sum::<f64>();
+    let first = core::hint::black_box(sum());
+    loop {
+        let again = core::hint::black_box(sum());
+        if again.to_bits() != first.to_bits() {
+            panic!("fpu task: {} != {}", again, first);
+        }
+        FPU_ROUNDS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Starts the worker tasks, then checks that `main` gets the CPU back (the
+/// workers never yield) and that every worker has made progress.
+fn start_tasks() {
+    task::init();
+    task::spawn("spin", spin_task);
+    task::spawn("nand", nand_task);
+    task::spawn("fpu", fpu_task);
+    task::sleep(irq::TICK_HZ / 5);
+    let (tasks, switches) = task::snapshot();
+    let progress = [&SPIN_COUNT, &NAND_ROUNDS, &FPU_ROUNDS].map(|c| c.load(Ordering::Relaxed));
+    if progress.contains(&0) {
+        panic!("a worker task never ran: {:?}", progress);
+    }
+    let names: Vec<&str> = tasks.iter().map(|t| t.name).collect();
+    println!("[task] {} after {} switches", names.join(" "), switches);
+    ok(format_args!("M4: {} tasks, round-robin, {} ms slices", tasks.len(), 1000 / irq::TICK_HZ));
+}
+
+/// Task lines: CPU share per task (ticks it was running for), then progress.
+fn task_status(line: usize) {
+    let (tasks, switches) = task::snapshot();
+    let total = tasks.iter().map(|t| t.ticks).sum::<u64>().max(1);
+    let mut cpu = String::from("cpu ");
+    for t in &tasks {
+        cpu += &format!(" {} {}%", t.name, t.ticks * 100 / total);
+    }
+    status_line(line, format_args!("{}", cpu));
+    status_line(
+        line + 1,
+        format_args!(
+            "spin {}  nand {}  fpu {}  sw {}",
+            SPIN_COUNT.load(Ordering::Relaxed),
+            NAND_ROUNDS.load(Ordering::Relaxed),
+            FPU_ROUNDS.load(Ordering::Relaxed),
+            switches
+        ),
+    );
+}
+
+fn counter_status(line: usize, level: bool, value: u64, edges: u64) {
+    status_line(
+        line,
+        format_args!("clk={}  q={:04b} ({:2})  edges={}", level as u8, value, value, edges),
+    );
+}
+
+/// Ticks between redraws of the task lines (10 per second).
+const TASK_REDRAW_TICKS: u64 = irq::TICK_HZ / 10;
+
+/// The `main` task: sleep a tick at a time; redraw the uptime and task lines
+/// and drive the NAND counter's clock from the tick count.
 fn interrupt_loop() -> ! {
     let mut c = Circuit::new();
     let (clk, one) = (c.input(), c.input());
@@ -183,20 +272,28 @@ fn interrupt_loop() -> ! {
     let q = c.counter::<4>(clk, one);
     c.eval().expect("counter did not settle");
     println!("[ctr ] 4-bit counter, {} NAND, timer-clocked", c.gate_count());
-    // Reserve a blank spacer, then an uptime row and a counter row. Rows are
-    // taken relative to the cursor, which stays valid if the screen scrolls.
-    println!();
-    println!();
-    let line = console::with(|c| c.row()).unwrap_or(1) - 1;
+    // Reserve a blank spacer, then rows for uptime, counter and two task
+    // lines. Rows are taken relative to the cursor, which stays valid if the
+    // screen scrolls.
+    for _ in 0..4 {
+        println!();
+    }
+    let line = console::with(|c| c.row()).unwrap_or(3) - 3;
     let mut seen = u64::MAX;
+    let mut drawn = u64::MAX;
     let mut level = false;
     let mut edges = 0u64;
     let mut value = c.get_bits(&q);
+    counter_status(line + 1, level, value, edges);
     loop {
         let t = irq::ticks();
         if t != seen {
             seen = t;
-            uptime(line, t / irq::TICK_HZ);
+            if t / TASK_REDRAW_TICKS != drawn {
+                drawn = t / TASK_REDRAW_TICKS;
+                uptime(line, t / irq::TICK_HZ);
+                task_status(line + 2);
+            }
 
             let next_level = (t / HALF_PERIOD_TICKS) % 2 == 1;
             if next_level != level {
@@ -213,13 +310,10 @@ fn interrupt_loop() -> ! {
                     panic!("counter changed {} -> {} on a falling edge", value, now);
                 }
                 value = now;
+                counter_status(line + 1, level, value, edges);
             }
-            status_line(
-                line + 1,
-                format_args!("clk={}  q={:04b} ({:2})  edges={}", level as u8, value, value, edges),
-            );
         }
-        arch::wait_for_interrupt();
+        task::sleep(1);
     }
 }
 
@@ -435,32 +529,55 @@ fn nand_demo() {
     );
 
     // 4-bit ripple-carry adder: show a few sums, then check every input.
-    let mut c = Circuit::new();
-    let (a, b, cin) = (c.inputs::<4>(), c.inputs::<4>(), c.input());
-    let (sum, cout) = c.adder(a, b, cin);
-    let mut add = |x: u64, y: u64, carry_in: bool| {
-        c.set_bits(&a, x);
-        c.set_bits(&b, y);
-        c.set(cin, carry_in);
-        c.eval().expect("adder did not settle");
-        c.get_bits(&sum) | (c.get(cout) as u64) << 4
-    };
+    let mut adder = Adder4::new();
     for (x, y) in [(3, 5), (7, 8), (9, 9), (15, 15)] {
-        let r = add(x, y, false);
+        let r = adder.add(x, y, false);
         println!("[nand] {:2} + {:2} = {:2}  ({:04b} + {:04b} = {:05b})", x, y, r, x, y, r);
     }
-    for x in 0..16 {
-        for y in 0..16 {
-            for carry_in in [false, true] {
-                let r = add(x, y, carry_in);
-                if r != x + y + carry_in as u64 {
-                    panic!("4-bit adder: {} + {} + {} gave {}", x, y, carry_in as u8, r);
+    adder.check_all();
+    ok(format_args!("M2.5: 4-bit adder 512/512 ({} NAND)", adder.c.gate_count()));
+}
+
+/// A NAND 4-bit ripple-carry adder with its input and output wires.
+struct Adder4 {
+    c: Circuit,
+    a: [Wire; 4],
+    b: [Wire; 4],
+    cin: Wire,
+    sum: [Wire; 4],
+    cout: Wire,
+}
+
+impl Adder4 {
+    fn new() -> Self {
+        let mut c = Circuit::new();
+        let (a, b, cin) = (c.inputs::<4>(), c.inputs::<4>(), c.input());
+        let (sum, cout) = c.adder(a, b, cin);
+        Self { c, a, b, cin, sum, cout }
+    }
+
+    /// Returns the 5-bit result of `x + y + carry_in`.
+    fn add(&mut self, x: u64, y: u64, carry_in: bool) -> u64 {
+        self.c.set_bits(&self.a, x);
+        self.c.set_bits(&self.b, y);
+        self.c.set(self.cin, carry_in);
+        self.c.eval().expect("adder did not settle");
+        self.c.get_bits(&self.sum) | (self.c.get(self.cout) as u64) << 4
+    }
+
+    /// Checks all 512 inputs against real addition; panics on a mismatch.
+    fn check_all(&mut self) {
+        for x in 0..16 {
+            for y in 0..16 {
+                for carry_in in [false, true] {
+                    let r = self.add(x, y, carry_in);
+                    if r != x + y + carry_in as u64 {
+                        panic!("4-bit adder: {} + {} + {} gave {}", x, y, carry_in as u8, r);
+                    }
                 }
             }
         }
     }
-    let gates = c.gate_count();
-    ok(format_args!("M2.5: 4-bit adder 512/512 ({} NAND)", gates));
 }
 
 fn banner() {
@@ -491,6 +608,8 @@ pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Keep other tasks from running (and drawing) over the report.
+    arch::disable_irqs();
     console::with(|c| c.set_color(ERR));
     println!("\n*** KERNEL PANIC ***");
     println!("{}", info);

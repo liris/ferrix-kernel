@@ -3,8 +3,9 @@
 //! Every vector entry saves x0/x1, records which of the 16 vectors fired and
 //! jumps to a common path that saves the rest of the general registers plus
 //! ELR/SPSR/ESR/FAR into a `TrapFrame` on the current stack, then calls
-//! `handle_exception`. On return the (possibly updated) ELR/SPSR are restored
-//! and execution resumes with `eret`.
+//! `handle_exception`. The handler returns the frame to resume: normally the
+//! same one, or another task's saved frame (on its own stack) to switch tasks.
+//! The exit path moves sp there, restores everything and `eret`s.
 //!
 //! FP/SIMD registers (q0-q31, FPCR, FPSR) are saved too: IRQs can arrive in
 //! the middle of any code, and compiled Rust uses SIMD registers freely.
@@ -102,6 +103,7 @@ ferrix_exception_common:
 
     mov x0, sp
     bl {handler}
+    mov sp, x0
 
     ldp x2, x3, [sp, #248]
     msr elr_el1, x2
@@ -193,28 +195,31 @@ fn ec_name(ec: u64) -> &'static str {
     }
 }
 
-extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) {
+extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) -> *mut TrapFrame {
     let ec = (frame.esr >> 26) & 0x3f;
     let iss = frame.esr & 0x1ff_ffff;
     let is_sync = kind % 4 == 0;
 
     // IRQ taken while running in the kernel (EL1, either stack pointer).
     if kind == 1 || kind == 5 {
-        crate::irq::handle();
-        return;
+        let ticked = crate::irq::handle();
+        return if ticked { crate::task::switch(frame, true) } else { frame };
     }
 
     if is_sync && ec == EC_BRK64 {
         crate::println!("[exc ] brk #{:#x} at {:#x}, resuming", iss & 0xffff, frame.elr);
         // ELR points at the BRK itself; skip it.
         frame.elr += 4;
-        return;
+        return frame;
+    }
+    if is_sync && ec == EC_SVC64 && iss & 0xffff == crate::task::SVC_YIELD {
+        return crate::task::switch(frame, false);
     }
     if is_sync && ec == EC_SVC64 {
         crate::println!("[exc ] svc #{:#x} (x0={:#x}), returning", iss & 0xffff, frame.x[0]);
         // ELR already points past the SVC. Report a result in x0.
         frame.x[0] = frame.x[0].wrapping_add(1);
-        return;
+        return frame;
     }
 
     panic!(

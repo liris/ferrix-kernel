@@ -15,9 +15,6 @@ sata0:1.deviceType = "cdrom-image"
 sata0:1.fileName = "../ferrix-kernel.iso"
 usb.present = "TRUE"
 usb_xhci.present = "TRUE"
-serial0.present = "TRUE"
-serial0.fileType = "file"
-serial0.fileName = "serial.log"
 floppy0.present = "FALSE"
-# Answer VMware dialogs (e.g. "replace serial.log?") so boots never block.
+# Answer any VMware dialog with its default so boots never block.
 msg.autoAnswer = "TRUE"
