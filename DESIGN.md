@@ -150,7 +150,13 @@ A milestone is done when it visibly works on VMware.
     - [x] **M9b**: `nand` as a shared crate, a heap for user programs, the builder's language (checked on QEMU: full adder truth tables, an SR latch from a forward wire, oscillation reported as unstable)
     - [x] **M9c**: four interrupt IN transfers in flight, after fast typing on QEMU stopped the keyboard; 150 keys at 40 ms intervals arrive intact
 
-What comes after M9 (for example handing capabilities over a channel, reclaiming the memory of finished programs, W^X for the kernel image, a scheduler that favours tasks just woken) will be planned separately.
+- [ ] **M10 OS foundations**: the groundwork left over from M7-M9, before the Nand2Tetris computer
+    - [ ] **M10a**: reclaim finished programs. A task that exits is only marked dead, since it is still on its own kernel stack; a reaper task later frees its kernel stack, its address space (user pages and page tables, then `tlbi aside1` and the ASID back for reuse), and its program entry and capabilities. Kernel task stacks are reclaimed the same way. Demo: `u5` is restarted every few seconds and killed each time, and the free page count stays put
+    - [ ] **M10b**: hand capabilities over a channel. A message is a value or a capability; `send_cap` moves a capability (the sender's slot becomes empty) and `recv` / `wait` return the receiver's new slot. Capabilities in flight or held by a program that ends are dropped by M10a's reaper. Demo: `u1` hands `u4` a screen capability, `u4` writes a line it could not before, `u1`'s own use of it now fails, and forged slots are still refused
+    - [ ] **M10c**: W^X for the kernel image. The PE section headers of the loaded image split it into code (read, execute), read-only data, and data (read, write), and `SCTLR_EL1.WXN` backs that up. Runtime services are never called, so their code is mapped non-executable. A walk of the tables shows `W+X pages 0`, and a new `fault-test` case writes to `.text` and gets the panic screen
+    - [ ] **M10d**: favour tasks just woken. `wake` marks a task, and the scheduler picks marked ready tasks first, clearing the mark when it runs, so nobody is starved. The screen shows the time from wake to run (`CNTVCT`), average and maximum
+
+After M10 comes the Nand2Tetris computer: an ALU and memory from NAND, the Hack CPU, then its assembler, VM and language, and finally Tetris. These will be planned milestone by milestone.
 
 ## Risks and open questions
 
