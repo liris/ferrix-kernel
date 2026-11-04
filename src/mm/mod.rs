@@ -10,6 +10,8 @@
 //!
 //! Single core: both are shared with preemptible tasks by masking IRQs.
 
+pub mod mmu;
+
 use crate::global::Global;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;

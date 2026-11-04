@@ -5,7 +5,7 @@
 //! by keys. Every change re-evaluates the NAND gates, and the outputs are
 //! checked against plain arithmetic as before: the counter must step by one
 //! on each rising edge and hold on each falling edge, and the adder must
-//! add. Pure logic: drawing and key input stay in `main`.
+//! add. Pure logic: drawing and key input stay in `screen`.
 
 use alloc::format;
 use alloc::string::String;

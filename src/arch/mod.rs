@@ -1,5 +1,7 @@
 //! AArch64 system register access.
 
+pub mod exception;
+
 use core::arch::asm;
 
 macro_rules! read_sysreg {

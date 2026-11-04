@@ -30,11 +30,12 @@
 //! (`ldtrb`), so PAN can stay on. Any other exception from EL0 kills just
 //! that task, and its line on screen says why.
 
-use crate::cap::{Cap, CapTable, Channels};
-use crate::exception::{self, TrapFrame};
+use crate::arch::exception::{self, TrapFrame};
 use crate::global::Global;
-use crate::mmu::{self, AddressSpace, Kind};
-use crate::{arch, mm, task};
+use crate::mm::mmu::{self, AddressSpace, Kind};
+use crate::proc::cap::{Cap, CapTable, Channels};
+use crate::proc::task;
+use crate::{arch, mm};
 use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::String;

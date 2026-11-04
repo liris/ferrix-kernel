@@ -4,7 +4,8 @@
 //! then lets the scheduler switch tasks. Drawing and NAND evaluation stay in
 //! tasks, which share the console and heap by masking IRQs around them.
 
-use crate::{arch, gic};
+use crate::arch;
+use crate::dev::gic;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// EL1 virtual timer PPI.

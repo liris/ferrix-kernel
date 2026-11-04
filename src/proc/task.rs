@@ -14,9 +14,11 @@
 //! The task table is only touched with IRQs masked, which is all the locking
 //! one CPU needs.
 
-use crate::exception::TrapFrame;
+use crate::arch;
+use crate::arch::exception::TrapFrame;
+use crate::dev::irq;
 use crate::global::Global;
-use crate::{arch, irq, mm, mmu};
+use crate::mm::{self, mmu};
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::ptr;

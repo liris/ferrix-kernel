@@ -6,7 +6,7 @@
 //! device memory (by the firmware, then by `mmu`), so registers are accessed
 //! directly.
 
-use crate::acpi::GicInfo;
+use crate::dev::acpi::GicInfo;
 use crate::global::Global;
 use crate::mmio::Region;
 use core::arch::asm;

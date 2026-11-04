@@ -250,7 +250,7 @@ pub fn _print(args: fmt::Arguments) {
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => ($crate::console::_print(format_args!($($arg)*)));
+    ($($arg:tt)*) => ($crate::dev::console::_print(format_args!($($arg)*)));
 }
 
 #[macro_export]

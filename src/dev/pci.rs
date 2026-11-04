@@ -8,9 +8,9 @@
 //!
 //! Config space and BARs are mapped as device memory on first use.
 
-use crate::acpi::Ecam;
+use crate::dev::acpi::Ecam;
+use crate::mm::mmu;
 use crate::mmio::Region;
-use crate::mmu;
 
 /// Configuration space per function.
 const CONFIG_SIZE: usize = 0x1000;

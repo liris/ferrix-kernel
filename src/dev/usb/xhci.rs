@@ -17,8 +17,10 @@
 //! both hypervisors is cache coherent, so barriers order the CPU's accesses
 //! and no cache maintenance is needed.
 
+use crate::dev::pci;
 use crate::mmio::Region;
-use crate::{arch, mm, pci, task};
+use crate::proc::task;
+use crate::{arch, mm};
 use core::arch::asm;
 
 // Capability registers.

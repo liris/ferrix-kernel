@@ -7,11 +7,15 @@
 //! once per tick and feeds each report to `keyboard`. Hubs are not supported yet, so only
 //! devices on root ports are seen.
 
+pub mod keyboard;
+pub mod xhci;
+
 use crate::global::Global;
-use crate::keyboard::{self, BootKeyboard};
-use crate::xhci::{self, DESC_DEVICE, Device, InterruptIn, REQ_GET_DESCRIPTOR, REQ_IN, Xhci};
-use crate::{println, task};
+use crate::println;
+use crate::proc::task;
 use alloc::vec::Vec;
+use keyboard::BootKeyboard;
+use xhci::{DESC_DEVICE, Device, InterruptIn, REQ_GET_DESCRIPTOR, REQ_IN, Xhci};
 
 const REQ_SET_CONFIGURATION: u8 = 9;
 const REQ_HID_SET_PROTOCOL: u8 = 0x0b;
