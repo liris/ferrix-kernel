@@ -301,3 +301,9 @@ impl Adder4 {
         }
     }
 }
+
+impl Default for Adder4 {
+    fn default() -> Self {
+        Self::new()
+    }
+}

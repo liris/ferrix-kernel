@@ -15,10 +15,10 @@
 //! one CPU needs.
 
 use crate::exception::TrapFrame;
+use crate::global::Global;
 use crate::{arch, irq, mm, mmu};
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::cell::UnsafeCell;
 use core::ptr;
 
 /// 64 KiB per task.
@@ -51,6 +51,10 @@ struct Task {
     ttbr: u64,
 }
 
+// SAFETY: `frame` points into the task's own kernel stack, used only by the scheduler and
+// the exception path while this task isn't running.
+unsafe impl Send for Task {}
+
 struct Scheduler {
     tasks: Vec<Task>,
     current: usize,
@@ -58,22 +62,17 @@ struct Scheduler {
     switches: u64,
 }
 
-struct Global(UnsafeCell<Option<Scheduler>>);
-unsafe impl Sync for Global {}
-
-static SCHED: Global = Global(UnsafeCell::new(None));
+static SCHED: Global<Scheduler> = Global::new("scheduler");
 
 fn with<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
-    arch::without_irqs(|| f(unsafe { (*SCHED.0.get()).as_mut() }.expect("scheduler not initialized")))
+    SCHED.with(f)
 }
 
 /// Turns the running code into task 0, `main`, and adds the idle task.
 pub fn init() {
     let ttbr = mmu::kernel_ttbr();
     let main = Task { name: "main", state: State::Ready, frame: ptr::null_mut(), ticks: 0, ttbr };
-    arch::without_irqs(|| unsafe {
-        *SCHED.0.get() = Some(Scheduler { tasks: alloc::vec![main], current: 0, idle: 0, switches: 0 })
-    });
+    SCHED.set(Scheduler { tasks: alloc::vec![main], current: 0, idle: 0, switches: 0 });
     let idle = spawn("idle", idle_task);
     with(|s| s.idle = idle);
 }
@@ -84,6 +83,7 @@ fn new_frame() -> *mut TrapFrame {
     let top = stack + STACK_PAGES * mm::PAGE_SIZE;
     // 816 bytes keeps sp 16-aligned.
     let frame = (top - size_of::<TrapFrame>()) as *mut TrapFrame;
+    // SAFETY: the top of a stack just allocated for this task; an all-zero frame is valid.
     unsafe { ptr::write_bytes(frame, 0, 1) };
     frame
 }
@@ -98,6 +98,7 @@ fn add(name: &'static str, frame: *mut TrapFrame, ttbr: u64) -> usize {
 /// Creates a ready task that runs `entry` on a fresh stack. Returns its id.
 pub fn spawn(name: &'static str, entry: fn()) -> usize {
     let frame = new_frame();
+    // SAFETY: a fresh frame that no task uses yet.
     unsafe {
         // A frame that "returns" into task_start(entry).
         (*frame).x[0] = entry as usize as u64;
@@ -112,6 +113,7 @@ pub fn spawn(name: &'static str, entry: fn()) -> usize {
 /// exceptions are taken on a kernel stack of its own. Returns its id.
 pub fn spawn_user(name: &'static str, ttbr: u64, entry: u64, sp: u64, args: [u64; 2]) -> usize {
     let frame = new_frame();
+    // SAFETY: a fresh frame that no task uses yet.
     unsafe {
         (*frame).x[0] = args[0];
         (*frame).x[1] = args[1];
@@ -190,6 +192,7 @@ fn idle_task() {
 
 /// Gives up the CPU to the next ready task.
 pub fn yield_now() {
+    // SAFETY: the exception path saves and restores every register around the switch.
     unsafe { asm!("svc #0", options(nostack)) };
 }
 
@@ -209,9 +212,11 @@ pub fn sleep(ticks: u64) {
 /// running task's state and returns the frame of the task to run next.
 /// `tick` charges the tick that caused the call to the running task.
 pub fn switch(frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame {
-    let Some(s) = (unsafe { (*SCHED.0.get()).as_mut() }) else {
-        return frame;
-    };
+    // Ticks before `init` keep running whatever was interrupted.
+    SCHED.try_with(|s| pick(s, frame, tick)).unwrap_or(frame)
+}
+
+fn pick(s: &mut Scheduler, frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame {
     let now = irq::ticks();
     let me = s.current;
     s.tasks[me].frame = frame;
@@ -235,7 +240,8 @@ pub fn switch(frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame {
     if next != me {
         s.switches += 1;
         if s.tasks[next].ttbr != s.tasks[me].ttbr {
-            mmu::set_ttbr0(s.tasks[next].ttbr);
+            // SAFETY: task TTBRs come from `kernel_ttbr` or a live `AddressSpace`.
+            unsafe { mmu::set_ttbr0(s.tasks[next].ttbr) };
         }
     }
     s.current = next;

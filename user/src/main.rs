@@ -57,6 +57,7 @@ const CHANNEL: u64 = 1;
 /// Returns (x0, x1) after the call.
 fn syscall(number: u64, a: u64, b: u64, c: u64) -> (u64, u64) {
     let (r0, r1);
+    // SAFETY: the kernel reads only the argument registers and restores the rest.
     unsafe {
         asm!(
             "svc #0",
@@ -151,6 +152,7 @@ impl Write for Line {
 /// Replaces row `row` of the screen lines in slot `cap`; returns the status.
 fn write_row(cap: u64, row: u64, text: &[u8]) -> u64 {
     let r0: u64;
+    // SAFETY: as in `syscall`; the kernel only reads `text`, within its length.
     unsafe {
         asm!(
             "svc #0",
@@ -194,7 +196,7 @@ fn count() -> ! {
 fn spin() -> ! {
     loop {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % (1 << 20) == 0 {
+        if n.is_multiple_of(1 << 20) {
             show(format_args!("spin  n={}M &n={:#x}", n >> 20, &COUNTER as *const _ as usize));
         }
     }
@@ -236,7 +238,12 @@ fn forge() -> ! {
 fn bad(kernel_addr: u64) -> ! {
     show(format_args!("bad   will read {:#x}", kernel_addr));
     sleep(300);
-    let v = unsafe { (kernel_addr as *const u64).read_volatile() };
+    let v: u64;
+    // SAFETY: kernel memory is mapped EL1-only, so the load faults and the kernel
+    // ends this program. It's an `asm!` load so no Rust-level UB is involved.
+    unsafe {
+        asm!("ldr {v}, [{a}]", a = in(reg) kernel_addr, v = out(reg) v, options(nostack, readonly))
+    };
     // Not reached: the read above faults.
     show(format_args!("bad   read {:#x} from the kernel!", v));
     exit(1)

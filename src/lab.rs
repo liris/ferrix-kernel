@@ -7,9 +7,9 @@
 //! on each rising edge and hold on each falling edge, and the adder must
 //! add. Pure logic: drawing and key input stay in `main`.
 
-use nand::{Adder4, Circuit, Wire};
 use alloc::format;
 use alloc::string::String;
+use nand::{Adder4, Circuit, Wire};
 
 /// One line of key help; fits in 48 columns.
 pub const HELP: &str = "keys 1-4:a 5-8:b c:carry spc:clk m:mode";

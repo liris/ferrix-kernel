@@ -10,6 +10,7 @@
 //!
 //! Single core: both are shared with preemptible tasks by masking IRQs.
 
+use crate::global::Global;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr;
@@ -26,12 +27,17 @@ pub struct PageAllocator {
     hint: usize,
 }
 
+// SAFETY: the bitmap belongs to the allocator alone; nothing else points into it.
+unsafe impl Send for PageAllocator {}
+
 impl PageAllocator {
     fn is_used(&self, page: usize) -> bool {
+        // SAFETY: callers pass `page < self.pages`, and the bitmap holds `self.pages` bits.
         unsafe { *self.bitmap.add(page / 8) & (1 << (page % 8)) != 0 }
     }
 
     fn set(&mut self, page: usize, used: bool) {
+        // SAFETY: as in `is_used`; `&mut self` makes this the only reference.
         let byte = unsafe { &mut *self.bitmap.add(page / 8) };
         if used {
             *byte |= 1 << (page % 8);
@@ -42,7 +48,8 @@ impl PageAllocator {
 
     /// Allocates `count` physically contiguous pages, returning the address.
     pub fn alloc(&mut self, count: usize) -> Option<usize> {
-        let start = self.find_run(self.hint, self.pages, count)
+        let start = self
+            .find_run(self.hint, self.pages, count)
             .or_else(|| self.find_run(1, self.hint, count))?;
         for p in start..start + count {
             self.set(p, true);
@@ -67,8 +74,17 @@ impl PageAllocator {
         None
     }
 
-    pub fn free(&mut self, addr: usize, count: usize) {
-        assert!(addr % PAGE_SIZE == 0, "unaligned page free {:#x}", addr);
+    /// Gives back `count` pages at `addr`.
+    ///
+    /// # Safety
+    ///
+    /// The pages must have come from `alloc`, and nothing may use them afterwards.
+    ///
+    /// # Panics
+    ///
+    /// If `addr` isn't page aligned or a page is already free.
+    pub unsafe fn free(&mut self, addr: usize, count: usize) {
+        assert!(addr.is_multiple_of(PAGE_SIZE), "unaligned page free {:#x}", addr);
         let first = addr / PAGE_SIZE;
         for p in first..first + count {
             assert!(self.is_used(p), "double free of page {:#x}", p * PAGE_SIZE);
@@ -91,17 +107,11 @@ impl PageAllocator {
     }
 }
 
-struct Global<T>(UnsafeCell<Option<T>>);
-unsafe impl<T> Sync for Global<T> {}
-
-static PAGES: Global<PageAllocator> = Global(UnsafeCell::new(None));
+static PAGES: Global<PageAllocator> = Global::new("page allocator");
 
 /// Runs `f` with the page allocator. Panics before `init`.
 pub fn pages<R>(f: impl FnOnce(&mut PageAllocator) -> R) -> R {
-    crate::arch::without_irqs(|| {
-        let pa = unsafe { (*PAGES.0.get()).as_mut() }.expect("page allocator not initialized");
-        f(pa)
-    })
+    PAGES.with(f)
 }
 
 pub fn init(mmap: &impl MemoryMap) {
@@ -119,6 +129,7 @@ pub fn init(mmap: &impl MemoryMap) {
         .phys_start as usize;
 
     // Everything starts out used; conventional regions are then released.
+    // SAFETY: conventional memory that nothing uses yet, identity mapped, and large enough.
     unsafe { ptr::write_bytes(bitmap as *mut u8, 0xff, bitmap_pages * PAGE_SIZE) };
     let mut pa = PageAllocator { bitmap: bitmap as *mut u8, pages, free: 0, usable: 0, hint: 1 };
     for d in conventional() {
@@ -136,7 +147,7 @@ pub fn init(mmap: &impl MemoryMap) {
         }
     }
     pa.usable = pa.free;
-    unsafe { *PAGES.0.get() = Some(pa) };
+    PAGES.set(pa);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +169,8 @@ pub struct Heap {
     grown: UnsafeCell<usize>,
 }
 
+// SAFETY: one CPU, and `head` and `grown` are only touched with IRQs masked (in `alloc`,
+// `dealloc`, and `grown_bytes`), so accesses never overlap.
 unsafe impl Sync for Heap {}
 
 fn round_up(x: usize, align: usize) -> usize {
@@ -175,11 +188,17 @@ impl Heap {
 
     /// Bytes the heap has taken from the page allocator so far.
     pub fn grown_bytes(&self) -> usize {
-        unsafe { *self.grown.get() }
+        // SAFETY: see `Sync` above.
+        crate::arch::without_irqs(|| unsafe { *self.grown.get() })
     }
 
     /// Inserts a free region in address order, merging with its neighbours.
+    ///
+    /// # Safety
+    ///
+    /// IRQs masked. `addr..addr + size` is unused memory, both multiples of `ALIGN`.
     unsafe fn insert(&self, addr: usize, size: usize) {
+        // SAFETY: the list holds only free blocks the heap owns; the new one is the caller's.
         unsafe {
             let head = &mut *self.head.get();
             let mut prev: *mut Block = ptr::null_mut();
@@ -209,7 +228,13 @@ impl Heap {
 
     /// First fit. All addresses and sizes are multiples of `ALIGN`, so any
     /// leftover in front of or behind the allocation is itself a valid block.
+    ///
+    /// # Safety
+    ///
+    /// IRQs masked; `size` and `align` are multiples of `ALIGN`.
     unsafe fn take(&self, size: usize, align: usize) -> *mut u8 {
+        // SAFETY: walks blocks the heap owns; the leftovers handed to `insert` are free and
+        // aligned (see above).
         unsafe {
             let head = &mut *self.head.get();
             let mut prev: *mut Block = ptr::null_mut();
@@ -240,11 +265,18 @@ impl Heap {
         }
     }
 
+    /// Takes pages for at least one `size` block at `align`.
+    ///
+    /// # Safety
+    ///
+    /// IRQs masked.
     unsafe fn grow(&self, size: usize, align: usize) -> bool {
         let count = GROW_PAGES.max((size + align).div_ceil(PAGE_SIZE));
-        let Some(addr) = (unsafe { (*PAGES.0.get()).as_mut() }).and_then(|pa| pa.alloc(count)) else {
+        // `try_with`: an allocation inside `mm::pages` fails instead of re-entering it.
+        let Some(addr) = PAGES.try_with(|pa| pa.alloc(count)).flatten() else {
             return false;
         };
+        // SAFETY: the pages are fresh and page aligned; IRQs are masked (caller).
         unsafe {
             *self.grown.get() += count * PAGE_SIZE;
             self.insert(addr, count * PAGE_SIZE);
@@ -253,10 +285,13 @@ impl Heap {
     }
 }
 
+// SAFETY: blocks handed out are taken off the free list, so they never overlap, and are
+// aligned to at least `layout.align()`.
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = block_size(&layout);
         let align = layout.align().max(ALIGN);
+        // SAFETY: IRQs are masked, and sizes are rounded to `ALIGN`.
         crate::arch::without_irqs(|| unsafe {
             let p = self.take(size, align);
             if !p.is_null() || !self.grow(size, align) {
@@ -267,6 +302,7 @@ unsafe impl GlobalAlloc for Heap {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `alloc` with this layout, so it is a whole free block now.
         crate::arch::without_irqs(|| unsafe { self.insert(ptr as usize, block_size(&layout)) });
     }
 }

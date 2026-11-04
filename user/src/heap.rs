@@ -25,6 +25,8 @@ struct Heap {
     ready: UnsafeCell<bool>,
 }
 
+// SAFETY: a user program is a single thread: preemption saves and restores it, but nothing
+// else in this address space runs in between, so heap calls never overlap.
 unsafe impl Sync for Heap {}
 
 #[global_allocator]
@@ -40,7 +42,12 @@ fn block_size(layout: &Layout) -> usize {
 
 impl Heap {
     /// Inserts a free region in address order, merging with its neighbours.
+    ///
+    /// # Safety
+    ///
+    /// `addr..addr + size` is unused memory in the arena, both multiples of `ALIGN`.
     unsafe fn insert(&self, addr: usize, size: usize) {
+        // SAFETY: the list holds only free blocks in the arena; the new one is the caller's.
         unsafe {
             let head = &mut *self.head.get();
             let mut prev: *mut Block = ptr::null_mut();
@@ -67,9 +74,13 @@ impl Heap {
     }
 }
 
+// SAFETY: blocks handed out are taken off the free list, so they never overlap, and are
+// aligned to at least `layout.align()`.
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let (size, align) = (block_size(&layout), layout.align().max(ALIGN));
+        // SAFETY: the arena goes on the list once, as one block; after that the list holds
+        // only free blocks, and leftovers handed to `insert` are free and aligned.
         unsafe {
             if !core::mem::replace(&mut *self.ready.get(), true) {
                 self.insert(self.arena.get() as usize, SIZE);
@@ -104,6 +115,7 @@ unsafe impl GlobalAlloc for Heap {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `alloc` with this layout, so it is a whole free block now.
         unsafe { self.insert(ptr as usize, block_size(&layout)) };
     }
 }
@@ -111,12 +123,15 @@ unsafe impl GlobalAlloc for Heap {
 /// Bytes on the free list.
 pub fn free_bytes() -> usize {
     let mut total = 0;
+    // SAFETY: single thread (see `Sync`), and no allocation runs during the walk.
     let mut cur = unsafe { *HEAP.head.get() };
     while !cur.is_null() {
+        // SAFETY: as above; every block on the list is a valid `Block`.
         unsafe {
             total += (*cur).size;
             cur = (*cur).next;
         }
     }
+    // SAFETY: as above.
     if unsafe { *HEAP.ready.get() } { total } else { SIZE }
 }

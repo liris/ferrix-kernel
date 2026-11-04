@@ -7,8 +7,8 @@
 //! reported again and again (idle repeat) but typed only once. The layout is
 //! US. Pure logic apart from the queue's IRQ masking.
 
+use crate::global::Global;
 use alloc::collections::VecDeque;
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const SHIFT_BITS: u8 = 0x22; // left and right shift
@@ -33,7 +33,8 @@ impl BootKeyboard {
         }
         let shift = report[0] & SHIFT_BITS != 0;
         for &k in keys {
-            if k != 0 && !self.held.contains(&k)
+            if k != 0
+                && !self.held.contains(&k)
                 && let Some(c) = to_char(k, shift)
             {
                 push(c);
@@ -65,14 +66,10 @@ fn to_char(usage: u8, shift: bool) -> Option<char> {
     Some(c as char)
 }
 
-struct Queue(UnsafeCell<VecDeque<char>>);
-unsafe impl Sync for Queue {}
-
-static QUEUE: Queue = Queue(UnsafeCell::new(VecDeque::new()));
+static QUEUE: Global<VecDeque<char>> = Global::new("key queue");
 
 fn push(c: char) {
-    crate::arch::without_irqs(|| {
-        let q = unsafe { &mut *QUEUE.0.get() };
+    QUEUE.with_default(|q| {
         if q.len() < QUEUE_MAX {
             q.push_back(c);
         }
@@ -81,7 +78,7 @@ fn push(c: char) {
 
 /// The next typed character, if any.
 pub fn read() -> Option<char> {
-    crate::arch::without_irqs(|| unsafe { (*QUEUE.0.get()).pop_front() })
+    QUEUE.with_default(VecDeque::pop_front)
 }
 
 static ERRORS: AtomicU64 = AtomicU64::new(0);

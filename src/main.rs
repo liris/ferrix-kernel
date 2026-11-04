@@ -9,10 +9,12 @@ mod cap;
 mod console;
 mod exception;
 mod gic;
+mod global;
 mod irq;
 mod keyboard;
 mod lab;
 mod mm;
+mod mmio;
 mod mmu;
 mod pci;
 mod task;
@@ -24,9 +26,10 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use console::{ACCENT, DIM, ERR, FG, Format, Framebuffer, OK};
+use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nand::{Adder4, Circuit, Wire};
-use console::{ACCENT, DIM, ERR, FG, Format, Framebuffer, OK};
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
 use uefi::prelude::*;
@@ -39,7 +42,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// What the kernel learns from the firmware before leaving boot services.
 struct BootInfo {
     fb: Framebuffer,
-    rsdp: Option<usize>,
+    rsdp: Option<acpi::Rsdp>,
 }
 
 #[entry]
@@ -52,7 +55,12 @@ fn efi_main() -> Status {
     console::init(info.fb);
     console::with(|c| c.clear());
     banner();
-    println!("[boot] framebuffer {}x{} stride={}", info.fb.width, info.fb.height, info.fb.stride);
+    println!(
+        "[boot] framebuffer {}x{} stride={}",
+        info.fb.width(),
+        info.fb.height(),
+        info.fb.stride()
+    );
 
     // SAFETY: nothing borrowed from boot services is used after this point;
     // the framebuffer is plain memory that stays mapped.
@@ -64,7 +72,8 @@ fn efi_main() -> Status {
 
 fn collect_boot_info() -> Result<BootInfo, Status> {
     let handle = boot::get_handle_for_protocol::<GraphicsOutput>().map_err(|e| e.status())?;
-    let mut gop = boot::open_protocol_exclusive::<GraphicsOutput>(handle).map_err(|e| e.status())?;
+    let mut gop =
+        boot::open_protocol_exclusive::<GraphicsOutput>(handle).map_err(|e| e.status())?;
     let mode = gop.current_mode_info();
     let format = match mode.pixel_format() {
         PixelFormat::Rgb => Format::Rgb,
@@ -72,19 +81,19 @@ fn collect_boot_info() -> Result<BootInfo, Status> {
         _ => return Err(Status::UNSUPPORTED),
     };
     let (width, height) = mode.resolution();
-    let fb = Framebuffer {
-        base: gop.frame_buffer().as_mut_ptr().cast(),
-        width,
-        height,
-        stride: mode.stride(),
-        format,
-    };
+    let base = gop.frame_buffer().as_mut_ptr().cast();
+    // SAFETY: GOP's framebuffer holds `stride * height` 32-bit pixels for the current mode,
+    // and after ExitBootServices nothing but the console touches it.
+    let fb = unsafe { Framebuffer::new(base, width, height, mode.stride(), format) };
 
     let rsdp = system::with_config_table(|entries| {
         entries
             .iter()
             .find(|e| e.guid == ConfigTableEntry::ACPI2_GUID)
-            .map(|e| e.address as usize)
+            // SAFETY: the firmware published this RSDP. ACPI tables aren't conventional
+            // memory, so the page allocator never hands them out, and the identity map
+            // keeps them mapped.
+            .map(|e| unsafe { acpi::Rsdp::new(e.address as usize) })
     });
 
     Ok(BootInfo { fb, rsdp })
@@ -102,7 +111,7 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
     let freq = arch::timer_freq();
     println!("[time] generic timer {} Hz", freq);
     match info.rsdp {
-        Some(addr) => println!("[acpi] RSDP at {:#x}", addr),
+        Some(rsdp) => println!("[acpi] RSDP at {:#x}", rsdp.addr()),
         None => println!("[acpi] no ACPI 2.0 table"),
     }
 
@@ -131,11 +140,13 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
 
     if cfg!(feature = "fault-test") {
         println!("[test] dereferencing a null pointer...");
-        let null = core::hint::black_box(core::ptr::null::<u64>());
-        let _ = unsafe { null.read_volatile() };
+        // SAFETY: page 0 is never mapped, so the load raises a data abort, which panics.
+        // It's an `asm!` load rather than a Rust one so no Rust-level UB is involved.
+        unsafe { asm!("ldr {0}, [{0}]", inout(reg) 0u64 => _, options(nostack, readonly)) };
     }
 
-    match gic.as_ref().map(gic::init) {
+    // SAFETY: `gic` came from `acpi::find_gic`, and `init_mmu` mapped its ranges.
+    match gic.as_ref().map(|g| unsafe { gic::init(g) }) {
         Some(Ok(rd)) => {
             println!("[gic ] GICv3 up, redistributor at {:#x}", rd);
             irq::start_timer(freq);
@@ -167,7 +178,10 @@ fn status_line(line: usize, args: core::fmt::Arguments) {
 }
 
 fn uptime(line: usize, secs: u64) {
-    status_line(line, format_args!("uptime {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60));
+    status_line(
+        line,
+        format_args!("uptime {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60),
+    );
 }
 
 /// Without interrupts: spin on the generic timer, redraw once per second.
@@ -248,7 +262,7 @@ const CLASS_XHCI: [u8; 3] = [0x0c, 0x03, 0x30];
 
 /// Finds the xHCI controller and sets up USB. Returns whether a keyboard
 /// was found.
-fn init_usb(rsdp: Option<usize>) -> bool {
+fn init_usb(rsdp: Option<acpi::Rsdp>) -> bool {
     let ecam = match rsdp.map(acpi::find_ecam) {
         Some(Ok(e)) => e,
         Some(Err(e)) => {
@@ -264,7 +278,8 @@ fn init_usb(rsdp: Option<usize>) -> bool {
         "[pci ] ECAM {:#x} seg {} bus {}-{}",
         ecam.base, ecam.segment, ecam.bus_start, ecam.bus_end
     );
-    let Some(f) = pci::find_class(&ecam, CLASS_XHCI) else {
+    // SAFETY: `ecam` came from `acpi::find_ecam`.
+    let Some(f) = (unsafe { pci::find_class(&ecam, CLASS_XHCI) }) else {
         println!("[pci ] no xHCI controller");
         return false;
     };
@@ -355,7 +370,9 @@ fn help_status(line: usize, keyboard: bool, focus: Focus, builder: bool) {
     match (focus, builder) {
         (Focus::Lab, false) => status_line(line, format_args!("{}", lab::HELP)),
         (Focus::Lab, true) => status_line(line, format_args!("{}  tab:u6", lab::HELP)),
-        (Focus::Builder, _) => status_line(line, format_args!("keys -> u6 circuit builder  tab:lab")),
+        (Focus::Builder, _) => {
+            status_line(line, format_args!("keys -> u6 circuit builder  tab:lab"))
+        }
     }
     let errors = keyboard::errors();
     if errors > 0 {
@@ -443,8 +460,10 @@ fn init_exceptions() {
     ok(format_args!("vectors at VBAR_EL1={:#x}", vbar));
 
     // Round-trip through both handled exception types.
+    // SAFETY: the handler skips the `brk` and resumes here.
     unsafe { core::arch::asm!("brk #0x42", clobber_abi("C")) };
     let ret: u64;
+    // SAFETY: the handler adds 1 to x0 and resumes after the `svc`.
     unsafe { core::arch::asm!("svc #0x7", inout("x0") 41u64 => ret, clobber_abi("C")) };
     if ret != 42 {
         panic!("svc returned {} instead of 42", ret);
@@ -454,17 +473,19 @@ fn init_exceptions() {
 
 fn init_memory(mmap: &impl MemoryMap) {
     mm::init(mmap);
-    let (free, usable, bitmap) = mm::pages(|pa| (pa.free_pages(), pa.usable_pages(), pa.bitmap_addr()));
+    let (free, usable, bitmap) =
+        mm::pages(|pa| (pa.free_pages(), pa.usable_pages(), pa.bitmap_addr()));
     println!(
         "[mm  ] {} MiB free in 4K pages, bitmap at {:#x}",
-        free * mm::PAGE_SIZE >> 20,
+        (free * mm::PAGE_SIZE) >> 20,
         bitmap
     );
 
     // Page allocator: take 16 contiguous pages and give them back.
     let addr = mm::pages(|pa| pa.alloc(16)).expect("page alloc failed");
     let during = mm::pages(|pa| pa.free_pages());
-    mm::pages(|pa| pa.free(addr, 16));
+    // SAFETY: allocated just above and not used.
+    mm::pages(|pa| unsafe { pa.free(addr, 16) });
     let after = mm::pages(|pa| pa.free_pages());
     if during + 16 != usable || after != usable {
         panic!("page accounting off: {} {} {}", usable, during, after);
@@ -489,23 +510,19 @@ fn init_memory(mmap: &impl MemoryMap) {
     ok("page allocator and heap");
 }
 
-/// Size of a GICv3 distributor's register frame.
-const GICD_SIZE: u64 = 0x1_0000;
-
 fn init_mmu(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::GicInfo>) {
     let mut m = mmu::Mapper::new();
 
     // Most specific first: the first mapping of an address wins.
     if let Some(g) = gic {
         if let Some(d) = g.gicd {
-            m.map(d, GICD_SIZE, mmu::Kind::Device);
+            m.map(d, gic::GICD_SIZE, mmu::Kind::Device);
         }
         if let Some((base, len)) = g.gicr {
             m.map(base, len as u64, mmu::Kind::Device);
         }
     }
-    let fb_bytes = (fb.stride * fb.height * 4) as u64;
-    m.map(fb.base as u64, fb_bytes, mmu::Kind::Uncached);
+    m.map(fb.addr(), fb.bytes(), mmu::Kind::Uncached);
 
     for d in mmap.entries() {
         let kind = match d.ty {
@@ -527,6 +544,9 @@ fn init_mmu(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::GicInfo>
 
     let old = mmu::ttbr0();
     let st = m.stats();
+    // SAFETY: everything the kernel touches is mapped above: all RAM in the memory map
+    // (code, stacks, heap, page tables, ACPI), the framebuffer, the GIC, and MMIO. Regions
+    // found later go through `map_live`.
     unsafe { m.activate() };
     println!("[mmu ] TTBR0 {:#x} -> {:#x} (ours)", old, mmu::ttbr0());
     println!(
@@ -549,7 +569,7 @@ fn init_mmu(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::GicInfo>
     ok("M3b: own page tables, null page unmapped");
 }
 
-fn report_gic(rsdp: Option<usize>) -> Option<acpi::GicInfo> {
+fn report_gic(rsdp: Option<acpi::Rsdp>) -> Option<acpi::GicInfo> {
     let Some(rsdp) = rsdp else {
         println!("[gic ] no ACPI, GIC unknown");
         return None;
@@ -673,9 +693,14 @@ fn ok(msg: impl core::fmt::Display) {
 }
 
 /// The UEFI target links like Windows and expects libc's `wcslen` (UTF-16).
+///
+/// # Safety
+///
+/// `s` must point to a NUL-terminated UTF-16 string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     let mut n = 0;
+    // SAFETY: every unit up to the NUL is readable (caller).
     while unsafe { *s.add(n) } != 0 {
         n += 1;
     }
@@ -686,6 +711,8 @@ pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // Keep other tasks from running (and drawing) over the report.
     arch::disable_irqs();
+    // SAFETY: IRQs are now off for good, and nothing returns from this handler.
+    unsafe { console::reclaim() };
     console::with(|c| c.set_color(ERR));
     println!("\n*** KERNEL PANIC ***");
     println!("{}", info);

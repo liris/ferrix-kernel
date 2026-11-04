@@ -3,7 +3,7 @@
 //! Glyphs come from font8x8 and are scaled 2x, so each cell is 16x16 pixels.
 //! The console only touches memory, so it keeps working after ExitBootServices.
 
-use core::cell::UnsafeCell;
+use crate::global::Global;
 use core::fmt;
 use font8x8::legacy::BASIC_LEGACY;
 
@@ -17,14 +17,54 @@ pub enum Format {
     Bgr,
 }
 
+/// A linear 32-bit framebuffer: `height` lines of `stride` pixels.
 #[derive(Clone, Copy)]
 pub struct Framebuffer {
-    pub base: *mut u32,
-    pub width: usize,
-    pub height: usize,
+    base: *mut u32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    format: Format,
+}
+
+// SAFETY: plain memory that only the console writes to.
+unsafe impl Send for Framebuffer {}
+
+impl Framebuffer {
+    /// # Safety
+    ///
+    /// `base` must point to `stride * height` writable pixels, `width <= stride`, and
+    /// nothing but the console may use that memory.
+    pub unsafe fn new(
+        base: *mut u32,
+        width: usize,
+        height: usize,
+        stride: usize,
+        format: Format,
+    ) -> Self {
+        Self { base, width, height, stride, format }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
     /// Pixels per scanline (may be larger than `width`).
-    pub stride: usize,
-    pub format: Format,
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    pub fn addr(&self) -> u64 {
+        self.base as u64
+    }
+
+    pub fn bytes(&self) -> u64 {
+        (self.stride * self.height * 4) as u64
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -69,8 +109,10 @@ impl Console {
     fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, c: Color) {
         let px = self.pixel(c);
         for yy in y..(y + h).min(self.fb.height) {
+            // SAFETY: `yy < height`, so the line is inside the framebuffer (`new`).
             let line = unsafe { self.fb.base.add(yy * self.fb.stride) };
             for xx in x..(x + w).min(self.fb.width) {
+                // SAFETY: `xx < width <= stride`.
                 unsafe { line.add(xx).write_volatile(px) };
             }
         }
@@ -113,10 +155,13 @@ impl Console {
         for (gy, bits) in glyph.iter().enumerate() {
             for sy in 0..SCALE {
                 let y = y0 + gy * SCALE + sy;
+                // SAFETY: `row < rows`, and `rows` cells plus the margin fit in `height`.
                 let line = unsafe { self.fb.base.add(y * self.fb.stride) };
                 for gx in 0..8 {
                     let px = if bits & (1 << gx) != 0 { fg } else { bg };
                     for sx in 0..SCALE {
+                        // SAFETY: `col < cols`, and `cols` cells plus the margin fit in
+                        // `width`.
                         unsafe { line.add(x0 + gx * SCALE + sx).write_volatile(px) };
                     }
                 }
@@ -137,6 +182,8 @@ impl Console {
         let stride = self.fb.stride;
         let top = MARGIN;
         let text_h = self.rows * CELL;
+        // SAFETY: both ranges are inside the text area, which fits in the framebuffer;
+        // `copy` allows the overlap.
         unsafe {
             core::ptr::copy(
                 self.fb.base.add((top + CELL) * stride),
@@ -172,20 +219,28 @@ impl fmt::Write for Console {
     }
 }
 
-/// Global console, shared between tasks. Single core: `with` masks IRQs so
-/// no switch can happen in the middle of a draw.
-struct Global(UnsafeCell<Option<Console>>);
-unsafe impl Sync for Global {}
-
-static CONSOLE: Global = Global(UnsafeCell::new(None));
+/// Global console, shared between tasks. `with` masks IRQs so no switch can
+/// happen in the middle of a draw.
+static CONSOLE: Global<Console> = Global::new("console");
 
 pub fn init(fb: Framebuffer) {
-    unsafe { *CONSOLE.0.get() = Some(Console::new(fb)) };
+    CONSOLE.set(Console::new(fb));
 }
 
-/// Runs `f` with the console, if one has been initialized.
+/// Runs `f` with the console, if one has been initialized and isn't in use
+/// further up the stack.
 pub fn with<R>(f: impl FnOnce(&mut Console) -> R) -> Option<R> {
-    crate::arch::without_irqs(|| unsafe { (*CONSOLE.0.get()).as_mut().map(f) })
+    CONSOLE.try_with(f)
+}
+
+/// Lets the panic handler draw even if the panic happened mid-draw.
+///
+/// # Safety
+///
+/// IRQs off for good, and the panicking code never resumes.
+pub unsafe fn reclaim() {
+    // SAFETY: passed on from the caller.
+    unsafe { CONSOLE.reclaim() };
 }
 
 #[doc(hidden)]

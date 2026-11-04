@@ -168,6 +168,8 @@ unsafe extern "C" {
 pub fn init() -> u64 {
     let vbar = &raw const ferrix_vectors as u64;
     assert!(vbar & 0x7ff == 0, "vector table must be 2 KiB aligned");
+    // SAFETY: the vector table is ours, aligned (checked), and in mapped code; with IRQs
+    // and FIQs masked first, only synchronous exceptions can reach it.
     unsafe {
         asm!("msr daifset, #3", options(nomem, nostack));
         asm!("msr vbar_el1, {}", "isb", in(reg) vbar, options(nostack));
@@ -212,7 +214,7 @@ pub fn ec_name(ec: u64) -> &'static str {
 extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) -> *mut TrapFrame {
     let ec = (frame.esr >> 26) & 0x3f;
     let iss = frame.esr & 0x1ff_ffff;
-    let is_sync = kind % 4 == 0;
+    let is_sync = kind.is_multiple_of(4);
 
     // IRQ taken in the kernel (EL1, either stack pointer) or in a user task.
     if kind == 1 || kind == 5 || kind == KIND_EL0_IRQ {
@@ -221,7 +223,11 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) -> *mut TrapFra
     }
 
     if kind == KIND_EL0_SYNC {
-        return if ec == EC_SVC64 { crate::user::syscall(frame) } else { crate::user::fault(frame, ec) };
+        return if ec == EC_SVC64 {
+            crate::user::syscall(frame)
+        } else {
+            crate::user::fault(frame, ec)
+        };
     }
 
     if is_sync && ec == EC_BRK64 {

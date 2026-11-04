@@ -13,7 +13,7 @@ keys. `user/` (EL0 programs) is built by the kernel's `build.rs` and embedded; `
 
 ## Verifying
 
-1. `make build`: zero warnings. `cargo clippy --release`: no new warnings.
+1. `make build` and `cargo clippy --release` (also in `user/`): zero warnings.
 2. QEMU: `make run-headless`, drive via `build/mon.sock` (`sendkey`, `screendump`). Every
    screen line must fit 48 columns.
 3. VMware: the user runs `make vm-run` and sends a screenshot. Done only after VMware.
@@ -27,12 +27,13 @@ keys. `user/` (EL0 programs) is built by the kernel's `build.rs` and embedded; `
   `mmu::user_readable` + `arch::read_user_byte` (`ldtrb`).
 - Never hardcode device addresses; find them through ACPI (MADT, MCFG) and PCI. Regions found
   after the MMU is on go in through `mmu::map_live`.
-- Single CPU: `Global` state is sound only because it's touched inside `arch::without_irqs`.
+- Shared kernel state lives in a `global::Global`; device registers and DMA memory are
+  reached through `mmio::Region`. Both keep `unsafe` out of the code that uses them.
 - xHCI: read capability registers as 32-bit dwords; write 64-bit registers low half first.
 - A user fault or bad syscall argument kills the task or returns a status, never panics.
 
 ## Code style
 
 Follow `.claude/rust-guidelines.md` (Microsoft Pragmatic Rust Guidelines adapted for this
-kernel) when writing and reviewing code. Match surrounding code; the tree isn't
-`rustfmt`-clean, so don't reformat files wholesale.
+kernel) when writing and reviewing code. Run `cargo fmt --all` (and in `user/`) before
+committing.

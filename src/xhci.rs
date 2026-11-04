@@ -17,9 +17,9 @@
 //! both hypervisors is cache coherent, so barriers order the CPU's accesses
 //! and no cache maintenance is needed.
 
+use crate::mmio::Region;
 use crate::{arch, mm, pci, task};
 use core::arch::asm;
-use core::ptr::{read_volatile, write_bytes, write_volatile};
 
 // Capability registers.
 /// CAPLENGTH in the low byte, HCIVERSION in the high half.
@@ -58,6 +58,9 @@ const PORTSC_KEEP: u32 = PORTSC_POWER | 0x7 << 25;
 
 // Runtime registers of interrupter 0.
 const IR0: usize = 0x20;
+const IR_SIZE: usize = 0x20;
+/// Doorbell 0 (the host's) plus one per slot.
+const DOORBELLS: usize = 256;
 const ERSTSZ: usize = 0x08;
 const ERSTBA: usize = 0x10;
 const ERDP: usize = 0x18;
@@ -110,26 +113,18 @@ const TIMEOUT_MS: u64 = 1000;
 
 type Trb = [u32; 4];
 
-fn read32(addr: usize) -> u32 {
-    unsafe { read_volatile(addr as *const u32) }
-}
-
-fn write32(addr: usize, v: u32) {
-    unsafe { write_volatile(addr as *mut u32, v) }
-}
-
 /// 64-bit registers are written as two dwords, low first: QEMU only accepts
 /// 32-bit accesses and acts on ERSTBA when its high half is written.
-fn write64(addr: usize, v: u64) {
-    write32(addr, v as u32);
-    write32(addr + 4, (v >> 32) as u32);
+fn write64(r: &Region, off: usize, v: u64) {
+    r.write32(off, v as u32);
+    r.write32(off + 4, (v >> 32) as u32);
 }
 
-/// Zeroed, page-aligned memory for the controller to read and write.
-fn dma_pages(count: usize) -> usize {
-    let addr = mm::pages(|pa| pa.alloc(count)).expect("out of memory for xHCI");
-    unsafe { write_bytes(addr as *mut u8, 0, count * mm::PAGE_SIZE) };
-    addr
+/// Orders the CPU's memory writes before what follows (an MMIO write, or
+/// the TRB's cycle bit).
+fn dsb() {
+    // SAFETY: a barrier only.
+    unsafe { asm!("dsb sy", options(nostack)) };
 }
 
 /// Polls `cond` until it holds or `ms` milliseconds pass, letting other
@@ -162,66 +157,65 @@ const RING_TRBS: usize = mm::PAGE_SIZE / 16;
 /// A ring we produce on (commands or one endpoint's transfers): one page,
 /// closed by a Link TRB back to its start.
 struct Ring {
-    base: usize,
+    mem: Region,
     next: usize,
     cycle: u32,
 }
 
 impl Ring {
     fn new() -> Self {
-        Self { base: dma_pages(1), next: 0, cycle: TRB_CYCLE }
+        Self { mem: Region::dma(1), next: 0, cycle: TRB_CYCLE }
     }
 
     /// Writes `trb` with the current cycle bit and returns its address.
     fn push(&mut self, trb: Trb) -> u64 {
-        let at = self.base + self.next * 16;
+        let at = self.next * 16;
         self.write(at, trb);
         self.next += 1;
         if self.next == RING_TRBS - 1 {
-            let base = self.base as u64;
+            let base = self.mem.addr();
             let link = [base as u32, (base >> 32) as u32, 0, TRB_LINK << 10 | LINK_TOGGLE_CYCLE];
-            self.write(self.base + self.next * 16, link);
+            self.write(self.next * 16, link);
             self.next = 0;
             self.cycle ^= TRB_CYCLE;
         }
-        at as u64
+        self.mem.addr() + at as u64
     }
 
     /// The cycle bit goes in last, so the controller never sees half a TRB.
     fn write(&self, at: usize, trb: Trb) {
-        let p = at as *mut u32;
-        unsafe {
-            for (i, &v) in trb[..3].iter().enumerate() {
-                write_volatile(p.add(i), v);
-            }
-            asm!("dmb ishst", options(nostack));
-            write_volatile(p.add(3), trb[3] | self.cycle);
+        for (i, &v) in trb[..3].iter().enumerate() {
+            self.mem.write32(at + i * 4, v);
         }
+        // SAFETY: a barrier only.
+        unsafe { asm!("dmb ishst", options(nostack)) };
+        self.mem.write32(at + 12, trb[3] | self.cycle);
     }
 }
 
 /// The ring the controller produces events on: one segment of one page.
 struct EventRing {
-    base: usize,
+    mem: Region,
     next: usize,
     cycle: u32,
 }
 
 impl EventRing {
-    fn pop(&mut self, ir: usize) -> Option<Trb> {
-        let p = (self.base + self.next * 16) as *const u32;
-        if unsafe { read_volatile(p.add(3)) } & TRB_CYCLE != self.cycle {
+    fn pop(&mut self, ir: &Region) -> Option<Trb> {
+        let at = self.next * 16;
+        if self.mem.read32(at + 12) & TRB_CYCLE != self.cycle {
             return None;
         }
         // Read the rest only after seeing the cycle bit.
+        // SAFETY: a barrier only.
         unsafe { asm!("dmb ishld", options(nostack)) };
-        let trb: Trb = core::array::from_fn(|i| unsafe { read_volatile(p.add(i)) });
+        let trb: Trb = core::array::from_fn(|i| self.mem.read32(at + i * 4));
         self.next += 1;
         if self.next == RING_TRBS {
             self.next = 0;
             self.cycle ^= TRB_CYCLE;
         }
-        write64(ir + ERDP, (self.base + self.next * 16) as u64 | ERDP_BUSY);
+        write64(ir, ERDP, (self.mem.addr() + self.next as u64 * 16) | ERDP_BUSY);
         Some(trb)
     }
 }
@@ -250,17 +244,19 @@ pub struct Device {
     pub slot: u8,
     pub port: u8,
     pub speed: u8,
-    input: usize,
+    input: Region,
     ep0: Ring,
     max_packet0: u16,
     /// One page for control transfer data.
-    buf: usize,
+    buf: Region,
 }
 
 impl Device {
     /// The first `len` bytes of the last control transfer's data.
     pub fn data(&self, len: usize) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.buf as *const u8, len.min(mm::PAGE_SIZE)) }
+        // SAFETY: the controller writes `buf` only during `Xhci::control`, which takes
+        // `&mut Device` and waits for the transfer to finish, so not while this borrow lives.
+        unsafe { self.buf.bytes(0, len) }
     }
 }
 
@@ -278,7 +274,7 @@ pub struct InterruptIn {
     slot: u8,
     dci: u32,
     ring: Ring,
-    buf: usize,
+    buf: Region,
     len: u32,
     /// The buffer the next completion belongs to: transfers on one ring
     /// complete in the order they were queued.
@@ -286,19 +282,27 @@ pub struct InterruptIn {
 }
 
 impl InterruptIn {
-    pub fn data(&self, index: usize, len: usize) -> &[u8] {
-        let at = self.buf + index * self.len as usize;
-        unsafe { core::slice::from_raw_parts(at as *const u8, len.min(self.len as usize)) }
+    /// The first `len` bytes received into buffer `index`.
+    ///
+    /// # Safety
+    ///
+    /// That buffer's transfer must have completed (`Xhci::poll` returned it) and not been
+    /// submitted again, so the controller isn't writing to it.
+    pub unsafe fn data(&self, index: usize, len: usize) -> &[u8] {
+        let size = self.len as usize;
+        // SAFETY: the controller is done with this buffer (caller).
+        unsafe { self.buf.bytes(index * size, len.min(size)) }
     }
 }
 
 pub struct Xhci {
-    cap: usize,
-    op: usize,
-    ir: usize,
-    db: usize,
+    /// BAR0; capability registers at its start.
+    cap: Region,
+    op: Region,
+    ir: Region,
+    db: Region,
     ctx_size: usize,
-    dcbaa: *mut u64,
+    dcbaa: Region,
     cmd: Ring,
     events: EventRing,
     pub version: u16,
@@ -306,25 +310,34 @@ pub struct Xhci {
     pub max_ports: u8,
 }
 
+// SAFETY: the registers and DMA memory belong to this controller alone; whoever holds the
+// `Xhci` is the only one driving it.
+unsafe impl Send for Xhci {}
+
 impl Xhci {
     /// Takes the controller from the firmware, resets it, sets up the
     /// command and event rings and starts it.
     pub fn init(f: &pci::Function) -> Result<Self, &'static str> {
-        let (base, _) = f.map_bar(0).ok_or("BAR0 not assigned")?;
+        let (base, size) = f.map_bar(0).ok_or("BAR0 not assigned")?;
         f.enable_memory_and_dma();
-        let cap = base as usize;
+        // SAFETY: BAR0 is this controller's register block, as the firmware assigned it,
+        // and `map_bar` mapped it as device memory.
+        let cap = unsafe { Region::new(base as usize, size as usize) };
         // Read as one dword: QEMU only accepts 32-bit accesses here.
-        let first = read32(cap + CAPLENGTH);
-        let params1 = read32(cap + HCSPARAMS1);
+        let first = cap.read32(CAPLENGTH);
+        let params1 = cap.read32(HCSPARAMS1);
+        let op = first as u8 as usize;
+        let ir = (cap.read32(RTSOFF) & !0x1f) as usize + IR0;
+        let db = (cap.read32(DBOFF) & !0x3) as usize;
         let hc = Self {
             cap,
-            op: cap + (first as u8 as usize),
-            ir: cap + (read32(cap + RTSOFF) & !0x1f) as usize + IR0,
-            db: cap + (read32(cap + DBOFF) & !0x3) as usize,
-            ctx_size: if read32(cap + HCCPARAMS1) & HCCPARAMS1_CSZ != 0 { 64 } else { 32 },
-            dcbaa: dma_pages(1) as *mut u64,
+            op: cap.sub(op, PORTSC + (params1 >> 24) as usize * PORT_STRIDE),
+            ir: cap.sub(ir, IR_SIZE),
+            db: cap.sub(db, DOORBELLS * 4),
+            ctx_size: if cap.read32(HCCPARAMS1) & HCCPARAMS1_CSZ != 0 { 64 } else { 32 },
+            dcbaa: Region::dma(1),
             cmd: Ring::new(),
-            events: EventRing { base: dma_pages(1), next: 0, cycle: TRB_CYCLE },
+            events: EventRing { mem: Region::dma(1), next: 0, cycle: TRB_CYCLE },
             version: (first >> 16) as u16,
             max_slots: params1 as u8,
             max_ports: (params1 >> 24) as u8,
@@ -334,35 +347,32 @@ impl Xhci {
         hc.reset()?;
 
         // Scratchpad pages the controller may ask for, listed in DCBAA[0].
-        let params2 = read32(cap + HCSPARAMS2);
+        let params2 = cap.read32(HCSPARAMS2);
         let scratch = ((params2 >> 21) & 0x1f) << 5 | params2 >> 27;
         if scratch > 0 {
-            let list = dma_pages((scratch as usize * 8).div_ceil(mm::PAGE_SIZE)) as *mut u64;
+            let list = Region::dma((scratch as usize * 8).div_ceil(mm::PAGE_SIZE));
             for i in 0..scratch as usize {
-                unsafe { *list.add(i) = dma_pages(1) as u64 };
+                list.write64(i * 8, Region::dma(1).addr());
             }
-            unsafe { *hc.dcbaa = list as u64 };
+            hc.dcbaa.write64(0, list.addr());
         }
 
-        let config = read32(hc.op + CONFIG) & !0xff;
-        write32(hc.op + CONFIG, config | hc.max_slots as u32);
-        write64(hc.op + DCBAAP, hc.dcbaa as u64);
-        write64(hc.op + CRCR, hc.cmd.base as u64 | TRB_CYCLE as u64);
+        let op = hc.op;
+        op.write32(CONFIG, op.read32(CONFIG) & !0xff | hc.max_slots as u32);
+        write64(&op, DCBAAP, hc.dcbaa.addr());
+        write64(&op, CRCR, hc.cmd.mem.addr() | TRB_CYCLE as u64);
 
         // One event ring segment table entry: (base, size in TRBs).
-        let erst = dma_pages(1) as *mut u64;
-        unsafe {
-            *erst = hc.events.base as u64;
-            *erst.add(1) = RING_TRBS as u64;
-        }
-        write32(hc.ir + ERSTSZ, 1);
-        write64(hc.ir + ERDP, hc.events.base as u64);
-        write64(hc.ir + ERSTBA, erst as u64);
+        let erst = Region::dma(1);
+        erst.write64(0, hc.events.mem.addr());
+        erst.write64(8, RING_TRBS as u64);
+        hc.ir.write32(ERSTSZ, 1);
+        write64(&hc.ir, ERDP, hc.events.mem.addr());
+        write64(&hc.ir, ERSTBA, erst.addr());
 
-        unsafe { asm!("dsb sy", options(nostack)) };
-        write32(hc.op + USBCMD, USBCMD_RUN);
-        let op = hc.op;
-        if !wait_for(TIMEOUT_MS, || read32(op + USBSTS) & USBSTS_HALTED == 0) {
+        dsb();
+        op.write32(USBCMD, USBCMD_RUN);
+        if !wait_for(TIMEOUT_MS, || op.read32(USBSTS) & USBSTS_HALTED == 0) {
             return Err("controller did not start");
         }
         Ok(hc)
@@ -371,13 +381,13 @@ impl Xhci {
     /// Walks the extended capability list and, if the firmware still owns
     /// the controller through the legacy support capability, asks for it.
     fn take_ownership(&self) -> Result<(), &'static str> {
-        let mut off = (read32(self.cap + HCCPARAMS1) >> 16) as usize * 4;
+        let cap = self.cap;
+        let mut off = (cap.read32(HCCPARAMS1) >> 16) as usize * 4;
         while off != 0 {
-            let addr = self.cap + off;
-            let v = read32(addr);
+            let v = cap.read32(off);
             if v & 0xff == XCAP_LEGACY && v & LEGACY_BIOS_OWNED != 0 {
-                write32(addr, v | LEGACY_OS_OWNED);
-                if !wait_for(TIMEOUT_MS, || read32(addr) & LEGACY_BIOS_OWNED == 0) {
+                cap.write32(off, v | LEGACY_OS_OWNED);
+                if !wait_for(TIMEOUT_MS, || cap.read32(off) & LEGACY_BIOS_OWNED == 0) {
                     return Err("firmware did not release the controller");
                 }
             }
@@ -391,43 +401,43 @@ impl Xhci {
 
     fn reset(&self) -> Result<(), &'static str> {
         let op = self.op;
-        write32(op + USBCMD, read32(op + USBCMD) & !USBCMD_RUN);
-        if !wait_for(TIMEOUT_MS, || read32(op + USBSTS) & USBSTS_HALTED != 0) {
+        op.write32(USBCMD, op.read32(USBCMD) & !USBCMD_RUN);
+        if !wait_for(TIMEOUT_MS, || op.read32(USBSTS) & USBSTS_HALTED != 0) {
             return Err("controller did not halt");
         }
-        write32(op + USBCMD, USBCMD_RESET);
+        op.write32(USBCMD, USBCMD_RESET);
         if !wait_for(TIMEOUT_MS, || {
-            read32(op + USBCMD) & USBCMD_RESET == 0 && read32(op + USBSTS) & USBSTS_NOT_READY == 0
+            op.read32(USBCMD) & USBCMD_RESET == 0 && op.read32(USBSTS) & USBSTS_NOT_READY == 0
         }) {
             return Err("controller did not come out of reset");
         }
         Ok(())
     }
 
-    fn portsc(&self, port: u8) -> usize {
-        self.op + PORTSC + (port as usize - 1) * PORT_STRIDE
+    fn portsc(port: u8) -> usize {
+        PORTSC + (port as usize - 1) * PORT_STRIDE
     }
 
     /// Numbers of the root hub ports with something plugged in.
     pub fn connected_ports(&self) -> impl Iterator<Item = u8> + '_ {
-        (1..=self.max_ports).filter(|&n| read32(self.portsc(n)) & PORTSC_CONNECTED != 0)
+        (1..=self.max_ports).filter(|&n| self.op.read32(Self::portsc(n)) & PORTSC_CONNECTED != 0)
     }
 
     /// Resets a port unless it is already enabled (USB 3 ports enable
     /// themselves), which also makes its speed known.
     pub fn enable_port(&self, number: u8) -> Result<Port, &'static str> {
-        let reg = self.portsc(number);
-        let sc = read32(reg);
+        let (op, reg) = (self.op, Self::portsc(number));
+        let sc = op.read32(reg);
         if sc & PORTSC_ENABLED == 0 {
-            write32(reg, sc & PORTSC_KEEP | PORTSC_RESET);
-            if !wait_for(TIMEOUT_MS, || read32(reg) & PORTSC_RESET_CHANGE != 0) {
+            op.write32(reg, sc & PORTSC_KEEP | PORTSC_RESET);
+            if !wait_for(TIMEOUT_MS, || op.read32(reg) & PORTSC_RESET_CHANGE != 0) {
                 return Err("port reset timed out");
             }
             // USB 2.0 gives a device 10 ms to recover after reset.
             wait_for(10, || false);
         }
-        write32(reg, read32(reg) & PORTSC_KEEP | PORTSC_CHANGES);
-        let sc = read32(reg);
+        op.write32(reg, op.read32(reg) & PORTSC_KEEP | PORTSC_CHANGES);
+        let sc = op.read32(reg);
         if sc & PORTSC_ENABLED == 0 {
             return Err("port did not enable");
         }
@@ -436,8 +446,8 @@ impl Xhci {
 
     fn ring_doorbell(&self, slot: u8, target: u32) {
         // TRBs written to RAM before the MMIO write that announces them.
-        unsafe { asm!("dsb sy", options(nostack)) };
-        write32(self.db + slot as usize * 4, target);
+        dsb();
+        self.db.write32(slot as usize * 4, target);
     }
 
     /// Polls the event ring until `want` matches an event; other events
@@ -446,7 +456,7 @@ impl Xhci {
         let (events, ir) = (&mut self.events, self.ir);
         let mut found = None;
         wait_for(TIMEOUT_MS, || {
-            while let Some(e) = events.pop(ir) {
+            while let Some(e) = events.pop(&ir) {
                 if want(&e) {
                     found = Some(e);
                     return true;
@@ -468,31 +478,30 @@ impl Xhci {
         Ok((e[3] >> 24) as u8)
     }
 
-    fn context(&self, base: usize, index: usize) -> *mut u32 {
-        (base + index * self.ctx_size) as *mut u32
+    /// Context `index` of an input context; its dwords are at offsets 0, 4, ...
+    fn context(&self, input: &Region, index: usize) -> Region {
+        input.sub(index * self.ctx_size, self.ctx_size)
     }
 
     /// Fills the device's input context: control (`add` flags), slot (with
     /// contexts up to index `entries` in use) and endpoint 0.
     fn prepare_input(&self, dev: &Device, add: u32, entries: u32) {
-        unsafe {
-            write_bytes(dev.input as *mut u8, 0, mm::PAGE_SIZE);
-            let control = self.context(dev.input, 0);
-            *control.add(1) = add;
-            let slot = self.context(dev.input, 1);
-            *slot = (dev.speed as u32) << 20 | entries << 27;
-            *slot.add(1) = (dev.port as u32) << 16;
-            let ep0 = self.context(dev.input, 2);
-            *ep0.add(1) = EP_ERROR_COUNT | EP_CONTROL << 3 | (dev.max_packet0 as u32) << 16;
-            let ring = dev.ep0.base as u64 | TRB_CYCLE as u64;
-            *ep0.add(2) = ring as u32;
-            *ep0.add(3) = (ring >> 32) as u32;
-            *ep0.add(4) = 8; // average TRB length: setup packets
-        }
+        dev.input.zero();
+        let control = self.context(&dev.input, 0);
+        control.write32(4, add);
+        let slot = self.context(&dev.input, 1);
+        slot.write32(0, (dev.speed as u32) << 20 | entries << 27);
+        slot.write32(4, (dev.port as u32) << 16);
+        let ep0 = self.context(&dev.input, 2);
+        ep0.write32(4, EP_ERROR_COUNT | EP_CONTROL << 3 | (dev.max_packet0 as u32) << 16);
+        let ring = dev.ep0.mem.addr() | TRB_CYCLE as u64;
+        ep0.write32(8, ring as u32);
+        ep0.write32(12, (ring >> 32) as u32);
+        ep0.write32(16, 8); // average TRB length: setup packets
     }
 
     fn input_command(&mut self, dev: &Device, ty: u32) -> Result<u8, &'static str> {
-        let input = dev.input as u64;
+        let input = dev.input.addr();
         self.command([input as u32, (input >> 32) as u32, 0, (dev.slot as u32) << 24 | ty << 10])
     }
 
@@ -505,7 +514,7 @@ impl Xhci {
             slot,
             port: port.number,
             speed: port.speed,
-            input: dma_pages(1),
+            input: Region::dma(1),
             ep0: Ring::new(),
             // Until the descriptor says otherwise: the minimum per speed.
             max_packet0: match port.speed {
@@ -513,9 +522,9 @@ impl Xhci {
                 4.. => 512,
                 _ => 8,
             },
-            buf: dma_pages(1),
+            buf: Region::dma(1),
         };
-        unsafe { *self.dcbaa.add(slot as usize) = dma_pages(1) as u64 };
+        self.dcbaa.write64(slot as usize * 8, Region::dma(1).addr());
         self.prepare_input(&dev, ADD_SLOT | ADD_EP0, 1);
         self.input_command(&dev, TRB_ADDRESS_DEVICE)?;
 
@@ -547,7 +556,7 @@ impl Xhci {
         let data = if len > 0 { SETUP_IN_DATA } else { 0 };
         dev.ep0.push([setup0, setup1, 8, TRB_SETUP << 10 | TRB_IMMEDIATE | data]);
         if len > 0 {
-            let buf = dev.buf as u64;
+            let buf = dev.buf.addr();
             dev.ep0.push([buf as u32, (buf >> 32) as u32, len as u32, TRB_DATA << 10 | TRB_DIR_IN]);
         }
         // The status stage goes the other way from the data (IN if none).
@@ -583,25 +592,23 @@ impl Xhci {
             (interval.max(1) as u32 * 8).ilog2().clamp(3, 10)
         };
         self.prepare_input(dev, ADD_SLOT | 1 << dci, dci);
-        unsafe {
-            let ctx = self.context(dev.input, 1 + dci as usize);
-            *ctx = period << 16;
-            *ctx.add(1) = EP_ERROR_COUNT | EP_INTERRUPT_IN << 3 | (max_packet as u32) << 16;
-            let tr = ring.base as u64 | TRB_CYCLE as u64;
-            *ctx.add(2) = tr as u32;
-            *ctx.add(3) = (tr >> 32) as u32;
-            // Average TRB length and max payload per service interval.
-            *ctx.add(4) = max_packet as u32 | (max_packet as u32) << 16;
-        }
+        let ctx = self.context(&dev.input, 1 + dci as usize);
+        ctx.write32(0, period << 16);
+        ctx.write32(4, EP_ERROR_COUNT | EP_INTERRUPT_IN << 3 | (max_packet as u32) << 16);
+        let tr = ring.mem.addr() | TRB_CYCLE as u64;
+        ctx.write32(8, tr as u32);
+        ctx.write32(12, (tr >> 32) as u32);
+        // Average TRB length and max payload per service interval.
+        ctx.write32(16, max_packet as u32 | (max_packet as u32) << 16);
         self.input_command(dev, TRB_CONFIGURE_ENDPOINT)?;
         // Interrupt endpoints carry at most 1024 bytes per packet.
-        let buf = dma_pages((IN_FLIGHT * max_packet as usize).div_ceil(mm::PAGE_SIZE));
+        let buf = Region::dma((IN_FLIGHT * max_packet as usize).div_ceil(mm::PAGE_SIZE));
         Ok(InterruptIn { slot: dev.slot, dci, ring, buf, len: max_packet as u32, done: 0 })
     }
 
     /// Queues one transfer into buffer `index` of the endpoint.
     pub fn submit(&mut self, ep: &mut InterruptIn, index: usize) {
-        let buf = (ep.buf + index * ep.len as usize) as u64;
+        let buf = ep.buf.addr() + (index * ep.len as usize) as u64;
         let flags = TRB_NORMAL << 10 | TRB_IOC | TRB_SHORT_OK;
         ep.ring.push([buf as u32, (buf >> 32) as u32, ep.len, flags]);
         self.ring_doorbell(ep.slot, ep.dci);
@@ -610,7 +617,7 @@ impl Xhci {
     /// Checks for the next completed transfer: which buffer, and the number
     /// of bytes received or an error. `None` while none has completed.
     pub fn poll(&mut self, ep: &mut InterruptIn) -> Option<(usize, Result<usize, &'static str>)> {
-        while let Some(e) = self.events.pop(self.ir) {
+        while let Some(e) = self.events.pop(&self.ir) {
             let mine = e[3] >> 24 == ep.slot as u32 && (e[3] >> 16) & 0x1f == ep.dci;
             if trb_type(&e) == EVENT_TRANSFER && mine {
                 let index = ep.done;

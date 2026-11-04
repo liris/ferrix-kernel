@@ -32,13 +32,13 @@
 
 use crate::cap::{Cap, CapTable, Channels};
 use crate::exception::{self, TrapFrame};
+use crate::global::Global;
 use crate::mmu::{self, AddressSpace, Kind};
 use crate::{arch, mm, task};
 use alloc::borrow::ToOwned;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::format;
-use core::cell::UnsafeCell;
 
 static ELF: &[u8] = include_bytes!(env!("USER_ELF"));
 
@@ -102,13 +102,10 @@ struct State {
     keys: Option<usize>,
 }
 
-struct Global(UnsafeCell<Option<State>>);
-unsafe impl Sync for Global {}
-
-static STATE: Global = Global(UnsafeCell::new(None));
+static STATE: Global<State> = Global::new("user state");
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
-    arch::without_irqs(|| f(unsafe { (*STATE.0.get()).get_or_insert_with(State::default) }))
+    STATE.with_default(f)
 }
 
 fn u16_at(b: &[u8], off: usize) -> u16 {
@@ -125,6 +122,7 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 
 fn alloc_zeroed(pages: usize) -> u64 {
     let pa = mm::pages(|p| p.alloc(pages)).expect("out of memory for a user program");
+    // SAFETY: pages just allocated, identity mapped and owned by nobody else.
     unsafe { core::ptr::write_bytes(pa as *mut u8, 0, pages * mm::PAGE_SIZE) };
     pa as u64
 }
@@ -144,18 +142,24 @@ fn load(elf: &[u8]) -> Result<(AddressSpace, u64), &'static str> {
     let mut space = AddressSpace::new();
     let page = mm::PAGE_SIZE as u64;
     for i in 0..phnum {
-        let ph = elf.get(phoff + i * phentsize..phoff + (i + 1) * phentsize).ok_or("truncated ELF")?;
+        let ph =
+            elf.get(phoff + i * phentsize..phoff + (i + 1) * phentsize).ok_or("truncated ELF")?;
         let (ty, flags) = (u32_at(ph, 0), u32_at(ph, 4));
         let (offset, vaddr) = (u64_at(ph, 8) as usize, u64_at(ph, 16));
         let (filesz, memsz) = (u64_at(ph, 32) as usize, u64_at(ph, 40));
         if ty != PT_LOAD || memsz == 0 {
             continue;
         }
+        if filesz as u64 > memsz {
+            return Err("segment larger in the file than in memory");
+        }
         let data = elf.get(offset..offset + filesz).ok_or("truncated ELF")?;
         let start = vaddr & !(page - 1);
         let end = (vaddr + memsz).next_multiple_of(page);
         let pa = alloc_zeroed(((end - start) / page) as usize);
         let dst = pa + (vaddr - start);
+        // SAFETY: `dst..dst + filesz` lies inside the pages just allocated, since
+        // `filesz <= memsz`; they can't overlap the ELF, which the allocator never owned.
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, filesz) };
         let kind = if flags & PF_X != 0 {
             // Written through the data cache, about to be fetched as code.
@@ -166,11 +170,14 @@ fn load(elf: &[u8]) -> Result<(AddressSpace, u64), &'static str> {
         } else {
             Kind::UserRo
         };
-        space.map(start, pa, end - start, kind);
+        // SAFETY: pages just allocated for this segment alone.
+        unsafe { space.map(start, pa, end - start, kind) };
     }
 
     let stack_bytes = (STACK_PAGES * mm::PAGE_SIZE) as u64;
-    space.map(STACK_TOP - stack_bytes, alloc_zeroed(STACK_PAGES), stack_bytes, Kind::UserData);
+    let stack = alloc_zeroed(STACK_PAGES);
+    // SAFETY: pages just allocated for this stack alone.
+    unsafe { space.map(STACK_TOP - stack_bytes, stack, stack_bytes, Kind::UserData) };
     Ok((space, entry))
 }
 
@@ -286,17 +293,16 @@ fn read_user(ptr: u64, len: u64) -> Option<String> {
 }
 
 /// `svc #0` from EL0. Returns the frame to resume.
-pub fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
-    let f = unsafe { &mut *frame };
+pub fn syscall(f: &mut TrapFrame) -> *mut TrapFrame {
     let (a, b, c, d) = (f.x[0], f.x[1], f.x[2], f.x[3]);
     match f.x[8] {
         SYS_EXIT => {
             note(format!("exited ({})", a));
-            return task::exit_from_trap(frame);
+            return task::exit_from_trap(f);
         }
         SYS_SLEEP => {
             f.x[0] = OK;
-            return task::sleep_from_trap(frame, a);
+            return task::sleep_from_trap(f, a);
         }
         SYS_WRITE => {
             f.x[0] = match with(|s| lookup(s, a).1) {
@@ -330,7 +336,7 @@ pub fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
                 Ok((chan, None)) if f.x[8] == SYS_WAIT => {
                     // Back onto the `svc`: it runs again once woken.
                     f.elr -= 4;
-                    return task::block_from_trap(frame, chan as u64);
+                    return task::block_from_trap(f, chan as u64);
                 }
                 Ok((_, None)) => (f.x[0], f.x[1]) = (ERR_EMPTY, 0),
                 Err(()) => (f.x[0], f.x[1]) = (ERR_CAP, 0),
@@ -338,7 +344,7 @@ pub fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         }
         _ => f.x[0] = ERR_CAP,
     }
-    frame
+    f
 }
 
 /// Fault status code (ISS bits 5:0) of an abort, in words.
@@ -357,8 +363,7 @@ const EC_DATA_ABORT_EL0: u64 = 0x24;
 const ISS_WNR: u64 = 1 << 6;
 
 /// Any other synchronous exception from EL0: the program is killed.
-pub fn fault(frame: *mut TrapFrame, ec: u64) -> *mut TrapFrame {
-    let f = unsafe { &*frame };
+pub fn fault(f: &mut TrapFrame, ec: u64) -> *mut TrapFrame {
     let iss = f.esr & 0x1ff_ffff;
     let what = match ec {
         EC_DATA_ABORT_EL0 => {
@@ -369,5 +374,5 @@ pub fn fault(frame: *mut TrapFrame, ec: u64) -> *mut TrapFrame {
         _ => exception::ec_name(ec).to_owned(),
     };
     note(format!("killed: {}", what));
-    task::exit_from_trap(frame)
+    task::exit_from_trap(f)
 }

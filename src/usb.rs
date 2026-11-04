@@ -7,11 +7,11 @@
 //! once per tick and feeds each report to `keyboard`. Hubs are not supported yet, so only
 //! devices on root ports are seen.
 
+use crate::global::Global;
 use crate::keyboard::{self, BootKeyboard};
 use crate::xhci::{self, DESC_DEVICE, Device, InterruptIn, REQ_GET_DESCRIPTOR, REQ_IN, Xhci};
 use crate::{println, task};
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 
 const REQ_SET_CONFIGURATION: u8 = 9;
 const REQ_HID_SET_PROTOCOL: u8 = 0x0b;
@@ -50,7 +50,9 @@ struct Interface {
 
 impl Interface {
     fn is_boot_keyboard(&self) -> bool {
-        self.class == CLASS_HID && self.subclass == HID_SUBCLASS_BOOT && self.protocol == HID_KEYBOARD
+        self.class == CLASS_HID
+            && self.subclass == HID_SUBCLASS_BOOT
+            && self.protocol == HID_KEYBOARD
     }
 }
 
@@ -112,7 +114,11 @@ fn parse_config(bytes: &[u8]) -> Vec<Interface> {
                     && d[2] & ENDPOINT_IN != 0
                     && d[3] & 0x3 == ENDPOINT_INTERRUPT
                 {
-                    i.interrupt_in = Some(Endpoint { address: d[2], max_packet: u16_at(d, 4) & 0x7ff, interval: d[6] });
+                    i.interrupt_in = Some(Endpoint {
+                        address: d[2],
+                        max_packet: u16_at(d, 4) & 0x7ff,
+                        interval: d[6],
+                    });
                 }
             }
             _ => {}
@@ -141,17 +147,22 @@ fn probe(hc: &mut Xhci, number: u8) -> Result<Probed, &'static str> {
 fn setup_keyboard(hc: &mut Xhci, p: &mut Probed) -> Result<InterruptIn, &'static str> {
     let i = p.interfaces.iter().find(|i| i.is_boot_keyboard()).ok_or("no keyboard interface")?;
     let ep = i.interrupt_in.as_ref().ok_or("keyboard has no interrupt IN endpoint")?;
-    let (number, address, max_packet, interval) = (i.number, ep.address, ep.max_packet, ep.interval);
+    let (number, address, max_packet, interval) =
+        (i.number, ep.address, ep.max_packet, ep.interval);
     hc.control(&mut p.dev, 0, REQ_SET_CONFIGURATION, p.config as u16, 0, 0)?;
-    hc.control(&mut p.dev, REQ_CLASS_INTERFACE, REQ_HID_SET_PROTOCOL, HID_BOOT_PROTOCOL, number as u16, 0)?;
+    hc.control(
+        &mut p.dev,
+        REQ_CLASS_INTERFACE,
+        REQ_HID_SET_PROTOCOL,
+        HID_BOOT_PROTOCOL,
+        number as u16,
+        0,
+    )?;
     hc.configure_interrupt_in(&p.dev, address, max_packet, interval)
 }
 
 /// Hands the controller and keyboard endpoint to the `kbd` task.
-struct Handover(UnsafeCell<Option<(Xhci, InterruptIn)>>);
-unsafe impl Sync for Handover {}
-
-static HANDOVER: Handover = Handover(UnsafeCell::new(None));
+static HANDOVER: Global<(Xhci, InterruptIn)> = Global::new("keyboard handover");
 
 /// Lists the devices on the root hub and starts the keyboard task if a
 /// keyboard is among them. Returns whether one was.
@@ -187,7 +198,7 @@ pub fn init(mut hc: Xhci) -> bool {
     let Some(ep) = keyboard else {
         return false;
     };
-    crate::arch::without_irqs(|| unsafe { *HANDOVER.0.get() = Some((hc, ep)) });
+    HANDOVER.set((hc, ep));
     task::spawn("kbd", keyboard_task);
     true
 }
@@ -195,8 +206,7 @@ pub fn init(mut hc: Xhci) -> bool {
 /// Keeps report requests queued and passes every report on, in order. A
 /// failed transfer is counted and simply requested again.
 fn keyboard_task() {
-    let taken = crate::arch::without_irqs(|| unsafe { (*HANDOVER.0.get()).take() });
-    let Some((mut hc, mut ep)) = taken else {
+    let Some((mut hc, mut ep)) = HANDOVER.take() else {
         return;
     };
     let mut kbd = BootKeyboard::default();
@@ -208,7 +218,9 @@ fn keyboard_task() {
             None => task::sleep(1),
             Some((i, result)) => {
                 match result {
-                    Ok(len) => kbd.report(ep.data(i, len)),
+                    // SAFETY: `poll` just returned buffer `i`, and it is resubmitted only
+                    // below, after the report is read.
+                    Ok(len) => kbd.report(unsafe { ep.data(i, len) }),
                     Err(_) => keyboard::count_error(),
                 }
                 hc.submit(&mut ep, i);

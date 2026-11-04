@@ -10,8 +10,7 @@ Use it two ways:
 
 - **Writing code:** new and changed code follows every rule below.
 - **Reviewing code:** check the diff against the checklist at the end. Report findings with the
-  ID, `file:line`, and a concrete failure (inputs/state → wrong result). Existing code that
-  predates this file is not a finding unless the diff touches it.
+  ID, `file:line`, and a concrete failure (inputs/state → wrong result).
 
 ## Safety and soundness
 
@@ -22,7 +21,7 @@ Otherwise make it `unsafe fn` with a `# Safety` section.
 
 **M-UNSAFE — unsafe needs a reason.** The reasons that exist here are platform ones: MMIO,
 system registers, `asm!`, page tables, DMA memory shared with a device, `GlobalAlloc`, and the
-`Global` wrappers. Not valid: `transmute` to shorten safe code, `unsafe impl Send/Sync` on
+two wrappers that contain the rest (`global::Global`, `mmio::Region`). Not valid: `transmute` to shorten safe code, `unsafe impl Send/Sync` on
 something that isn't actually protected, bypassing lifetimes.
 
 - Every `unsafe { }` block gets a `// SAFETY:` comment saying why the preconditions hold
@@ -31,10 +30,12 @@ something that isn't actually protected, bypassing lifetimes.
 - Keep unsafe blocks small and wrap them in a safe function with a narrow API, so callers
   don't need `unsafe` (e.g. one `read32`/`write32` per register block, not volatile
   pointer arithmetic at call sites).
-- `unsafe impl Sync for Global` is sound only because the state is reached through
-  `arch::without_irqs` on one CPU. Any new `Global` follows the same pattern, accessed through
-  one closure-taking function (like `mm::pages` and `task::with`). Say so in the SAFETY comment.
-  Adding a second CPU invalidates all of these; that is a design change, not a local fix.
+- Shared state goes in a `global::Global<T>`, never a new `UnsafeCell` + `unsafe impl Sync`.
+  Its `Sync` relies on one CPU with IRQs masked inside `with`; a second CPU invalidates it,
+  which is a design change, not a local fix. Types holding raw pointers need an
+  `unsafe impl Send` saying who owns the memory.
+- Registers and DMA memory go through `mmio::Region`; the only `unsafe` is creating one, with
+  a SAFETY comment saying where the range came from.
 
 **M-UNSAFE-IMPLIES-UB.** Mark a function `unsafe` only when misuse can cause UB, not because it
 is dangerous in some other way (resetting a controller, killing a task).
@@ -111,9 +112,9 @@ roadmap.
 
 ## Lints and verification
 
-**M-STATIC-VERIFICATION.** `cargo build --release` has zero warnings. New code adds no
-`cargo clippy --release` warnings (the existing ones are known debt; fix them when touching that
-code). Miri doesn't run on this target; `nand` logic is host-testable instead.
+**M-STATIC-VERIFICATION.** `cargo build --release` and `cargo clippy --release` (kernel and
+`user/`) have zero warnings, and `cargo fmt --all --check` passes. Miri doesn't run on this
+target; `nand` logic is host-testable instead.
 
 **M-LINT-OVERRIDE-EXPECT.** Silence a lint with `#[expect(lint, reason = "...")]`, never
 `#[allow]`.
@@ -146,7 +147,7 @@ kernel needs global state; see the `Global` rule above), `M-OOBE` and `-sys` cra
    (M-UNSOUND)
 3. User memory touched from EL1 without `user_readable` + `read_user_byte`? (PAN: crashes on
    VMware only.)
-4. Global state accessed outside `without_irqs`, or held across a point that can switch tasks?
+4. Shared state outside a `Global`, or registers/DMA touched without a `Region`?
 5. Panic on user, device or firmware input instead of an error? Unbounded hardware wait?
    (M-PANIC-ON-BUG)
 6. Unnamed magic numbers or hardcoded device addresses? (M-DOCUMENTED-MAGIC)

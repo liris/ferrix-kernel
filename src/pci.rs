@@ -9,8 +9,11 @@
 //! Config space and BARs are mapped as device memory on first use.
 
 use crate::acpi::Ecam;
+use crate::mmio::Region;
 use crate::mmu;
-use core::ptr::{read_volatile, write_volatile};
+
+/// Configuration space per function.
+const CONFIG_SIZE: usize = 0x1000;
 
 const VENDOR_ID: usize = 0x00;
 const COMMAND: usize = 0x04;
@@ -26,7 +29,7 @@ const BAR_TYPE_64: u32 = 0b10 << 1;
 
 /// One function's configuration space.
 pub struct Function {
-    cfg: usize,
+    cfg: Region,
     pub bus: u8,
     pub device: u8,
     pub function: u8,
@@ -34,15 +37,15 @@ pub struct Function {
 
 impl Function {
     fn read32(&self, off: usize) -> u32 {
-        unsafe { read_volatile((self.cfg + off) as *const u32) }
+        self.cfg.read32(off)
     }
 
     fn write32(&self, off: usize, v: u32) {
-        unsafe { write_volatile((self.cfg + off) as *mut u32, v) }
+        self.cfg.write32(off, v)
     }
 
     fn read16(&self, off: usize) -> u16 {
-        (self.read32(off & !3) >> (off & 2) * 8) as u16
+        (self.read32(off & !3) >> ((off & 2) * 8)) as u16
     }
 
     fn write16(&self, off: usize, v: u16) {
@@ -101,7 +104,11 @@ impl Function {
 
 /// Finds the first function whose class code (class, subclass, prog-if)
 /// matches.
-pub fn find_class(ecam: &Ecam, class: [u8; 3]) -> Option<Function> {
+///
+/// # Safety
+///
+/// `ecam` must come from `acpi::find_ecam`.
+pub unsafe fn find_class(ecam: &Ecam, class: [u8; 3]) -> Option<Function> {
     // The MCFG base is where bus 0 would be, even if the range starts later.
     let (first, last) = (ecam.bus_start as u64, ecam.bus_end as u64);
     mmu::map_live(ecam.base + (first << 20), (last - first + 1) << 20, mmu::Kind::Device);
@@ -112,6 +119,8 @@ pub fn find_class(ecam: &Ecam, class: [u8; 3]) -> Option<Function> {
             for function in 0..8u8 {
                 let cfg = ecam.base as usize
                     + ((bus as usize) << 20 | (device as usize) << 15 | (function as usize) << 12);
+                // SAFETY: this function's window in the ECAM range (caller), mapped above.
+                let cfg = unsafe { Region::new(cfg, CONFIG_SIZE) };
                 let f = Function { cfg, bus, device, function };
                 if f.read32(VENDOR_ID) as u16 == 0xffff {
                     // No device at function 0 means none at all.

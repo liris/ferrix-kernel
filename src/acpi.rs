@@ -6,6 +6,24 @@
 
 use core::ptr::read_unaligned;
 
+/// Address of the firmware's ACPI 2.0 RSDP.
+#[derive(Clone, Copy)]
+pub struct Rsdp(usize);
+
+impl Rsdp {
+    /// # Safety
+    ///
+    /// `addr` must be the RSDP the firmware published, and the tables it leads to must stay
+    /// mapped and unmodified.
+    pub unsafe fn new(addr: usize) -> Self {
+        Self(addr)
+    }
+
+    pub fn addr(self) -> usize {
+        self.0
+    }
+}
+
 pub struct GicInfo {
     /// GIC version from the distributor entry (0 = "probe the hardware").
     pub version: u8,
@@ -16,26 +34,36 @@ pub struct GicInfo {
     pub its: usize,
 }
 
+// Safety for these readers: `base + off` must be readable for the size read. Within the
+// tables reached from an `Rsdp`, offsets inside a table's length are.
+
 unsafe fn u8_at(base: usize, off: usize) -> u8 {
+    // SAFETY: see above; `read_unaligned` has no alignment requirement.
     unsafe { read_unaligned((base + off) as *const u8) }
 }
 
 unsafe fn u32_at(base: usize, off: usize) -> u32 {
+    // SAFETY: as for `u8_at`.
     unsafe { read_unaligned((base + off) as *const u32) }
 }
 
 unsafe fn u64_at(base: usize, off: usize) -> u64 {
+    // SAFETY: as for `u8_at`.
     unsafe { read_unaligned((base + off) as *const u64) }
 }
 
 unsafe fn sig_is(base: usize, sig: &[u8]) -> bool {
+    // SAFETY: as for `u8_at`, for `sig.len()` bytes.
     unsafe { core::slice::from_raw_parts(base as *const u8, sig.len()) == sig }
 }
 
 /// Header shared by all system description tables.
 const SDT_HEADER_LEN: usize = 36;
 
-fn find_table(rsdp: usize, sig: &[u8; 4]) -> Result<usize, &'static str> {
+fn find_table(rsdp: Rsdp, sig: &[u8; 4]) -> Result<usize, &'static str> {
+    let rsdp = rsdp.0;
+    // SAFETY: `Rsdp` guarantees the RSDP, and the XSDT and tables it points to, are mapped.
+    // Offsets stay inside the 36-byte RSDP, the XSDT's length, and each table's header.
     unsafe {
         if !sig_is(rsdp, b"RSD PTR ") {
             return Err("bad RSDP signature");
@@ -55,9 +83,11 @@ fn find_table(rsdp: usize, sig: &[u8; 4]) -> Result<usize, &'static str> {
     }
 }
 
-pub fn find_gic(rsdp: usize) -> Result<GicInfo, &'static str> {
+pub fn find_gic(rsdp: Rsdp) -> Result<GicInfo, &'static str> {
     let madt = find_table(rsdp, b"APIC")?;
     let mut info = GicInfo { version: 0, gicd: None, gicr: None, cpus: 0, its: 0 };
+    // SAFETY: `madt` came from `find_table`, and every read is inside its length: the loop
+    // stops when a structure header would cross it.
     unsafe {
         let len = u32_at(madt, 4) as usize;
         // Interrupt controller structures start after the 8-byte MADT body.
@@ -94,8 +124,9 @@ pub struct Ecam {
 }
 
 /// The first ECAM window listed in the MCFG.
-pub fn find_ecam(rsdp: usize) -> Result<Ecam, &'static str> {
+pub fn find_ecam(rsdp: Rsdp) -> Result<Ecam, &'static str> {
     let mcfg = find_table(rsdp, b"MCFG")?;
+    // SAFETY: `mcfg` came from `find_table`, and the length check keeps the reads inside it.
     unsafe {
         // Allocation entries start after 8 reserved bytes, 16 bytes each.
         let first = SDT_HEADER_LEN + 8;

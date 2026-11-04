@@ -12,7 +12,7 @@
 //! same. Feedback is built from a forward wire (`q = wire`) driven later by
 //! one NAND (`q <- nand s qn`). Simulation is the kernel's own `nand` crate.
 
-use crate::{heap, Line};
+use crate::{Line, heap};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -29,7 +29,8 @@ const MAX_DEPTH: usize = 16;
 /// `table` lists every combination of at most this many inputs.
 const TABLE_MAX: usize = 4;
 
-const KEYWORDS: &[&str] = &["in", "def", "set", "show", "table", "parts", "clear", "demo", "help", "nand", "wire"];
+const KEYWORDS: &[&str] =
+    &["in", "def", "set", "show", "table", "parts", "clear", "demo", "help", "nand", "wire"];
 
 const HELP: &[&str] = &[
     "in a b          make inputs a and b",
@@ -170,7 +171,12 @@ fn expr<'a>(
 }
 
 /// Builds a whole expression; nothing may follow it.
-fn whole<'a>(circuit: &mut Circuit, parts: &[Part], env: &Env, toks: &[&'a str]) -> Result<'a, Wire> {
+fn whole<'a>(
+    circuit: &mut Circuit,
+    parts: &[Part],
+    env: &Env,
+    toks: &[&'a str],
+) -> Result<'a, Wire> {
     let mut pos = 0;
     let w = expr(circuit, parts, env, toks, &mut pos, 0)?;
     match toks.get(pos) {
@@ -181,7 +187,13 @@ fn whole<'a>(circuit: &mut Circuit, parts: &[Part], env: &Env, toks: &[&'a str])
 
 /// Instantiates a part: fresh gates for its body, with the parameters bound
 /// to `args`. Errors carry no word: the body's text is about to be dropped.
-fn expand(circuit: &mut Circuit, parts: &[Part], part: &Part, args: &[Wire], depth: usize) -> Result<'static, Wire> {
+fn expand(
+    circuit: &mut Circuit,
+    parts: &[Part],
+    part: &Part,
+    args: &[Wire],
+    depth: usize,
+) -> Result<'static, Wire> {
     if depth > MAX_DEPTH {
         return Err(Error("parts nest too deep in", ""));
     }
@@ -190,7 +202,9 @@ fn expand(circuit: &mut Circuit, parts: &[Part], part: &Part, args: &[Wire], dep
     let mut result = None;
     for stmt in toks.split(|&t| t == ";") {
         let r = match stmt {
-            [name, "=", rest @ ..] => whole(circuit, parts, &env, rest).map(|w| env.push((name, w))),
+            [name, "=", rest @ ..] => {
+                whole(circuit, parts, &env, rest).map(|w| env.push((name, w)))
+            }
             _ => whole(circuit, parts, &env, stmt).map(|w| result = Some(w)),
         };
         r.map_err(|e| Error(e.0, ""))?;
@@ -224,7 +238,10 @@ impl Builder {
             [name, params @ ..] => (*name, params),
             [] => return Err(Error("def needs a name", "")),
         };
-        if !valid_name(name) || self.parts.iter().any(|p| p.name == name) || self.wire(name).is_some() {
+        if !valid_name(name)
+            || self.parts.iter().any(|p| p.name == name)
+            || self.wire(name).is_some()
+        {
             return Err(Error("not a usable name", name));
         }
         if let Some(&bad) = params.iter().find(|p| !valid_name(p)) {
@@ -274,7 +291,12 @@ impl Builder {
         for &s in &sources {
             let _ = write!(head, "{} ", self.name_of(s));
         }
-        ui.say(format_args!("{}| {}  ({} NAND in all)", head.as_str(), self.name_of(w), self.circuit.gate_count()));
+        ui.say(format_args!(
+            "{}| {}  ({} NAND in all)",
+            head.as_str(),
+            self.name_of(w),
+            self.circuit.gate_count()
+        ));
         let saved: Vec<bool> = sources.iter().map(|&s| self.circuit.get(s)).collect();
         let n = sources.len();
         let mut line = Line::new();
@@ -325,7 +347,10 @@ impl Builder {
                 for p in &self.parts {
                     let _ = write!(l, "{}/{} ", p.name, p.params.len());
                 }
-                ui.say(format_args!("{}", if self.parts.is_empty() { "no parts (try demo)" } else { l.as_str() }));
+                ui.say(format_args!(
+                    "{}",
+                    if self.parts.is_empty() { "no parts (try demo)" } else { l.as_str() }
+                ));
             }
             ["def", ..] => {
                 let msg = self.define(line, &toks)?;
@@ -370,7 +395,11 @@ impl Builder {
                 }
                 drop(env);
                 self.circuit.drive(w, a, b);
-                ui.say(format_args!("{} driven, {} NAND added", name, self.circuit.gate_count() - before));
+                ui.say(format_args!(
+                    "{} driven, {} NAND added",
+                    name,
+                    self.circuit.gate_count() - before
+                ));
             }
             [name, "=", rest @ ..] => {
                 let env = env_of(&self.names);
