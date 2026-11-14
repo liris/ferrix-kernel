@@ -29,6 +29,11 @@
 //! the kernel reads through them, and the reads themselves are unprivileged
 //! (`ldtrb`), so PAN can stay on. Any other exception from EL0 kills just
 //! that task, and its line on screen says why.
+//!
+//! A program that ends loses its entry here, and with it its capabilities,
+//! at once; the reaper (`task`) frees its address space and kernel stack
+//! afterwards. The `respawn` task starts `u5`, which is always killed, again
+//! every few seconds, so the free page count shows that nothing leaks.
 
 use crate::arch::exception::{self, TrapFrame};
 use crate::global::Global;
@@ -75,6 +80,9 @@ const STACK_PAGES: usize = 4;
 const STACK_TOP: u64 = mmu::USER_END;
 /// Longest line a program may write; with its name it fits 48 columns.
 const LINE_MAX: usize = 44;
+/// `u5` is started again this long after it was last started (5 s): it
+/// lives 3 s, so the reaper has long freed it by then.
+const RESPAWN_TICKS: u64 = 500;
 
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
@@ -97,10 +105,26 @@ struct Program {
 struct State {
     programs: Vec<Program>,
     lines: Vec<String>,
+    /// The name shown in front of each line: a program's, on its first.
+    /// Kept when the program ends, as its last words stay on the line.
+    labels: Vec<Option<&'static str>>,
     /// Bumped on every change to `lines`, so they are redrawn only then.
     generation: u64,
     channels: Channels,
     keys: Option<usize>,
+    /// `u5`'s screen line, for `respawn`.
+    bad_line: usize,
+    respawns: Respawns,
+}
+
+/// What `respawn` has done so far, for the screen.
+#[derive(Default, Clone, Copy)]
+pub struct Respawns {
+    /// Times `u5` was started again.
+    pub count: u64,
+    /// Free pages just before the last restart, with the previous `u5` and
+    /// `blip` already reaped: the same every time if nothing leaks.
+    pub free_pages: usize,
 }
 
 static STATE: Global<State> = Global::new("user state");
@@ -140,7 +164,7 @@ fn load(elf: &[u8]) -> Result<(AddressSpace, u64), &'static str> {
     let (entry, phoff) = (u64_at(elf, 24), u64_at(elf, 32) as usize);
     let (phentsize, phnum) = (u16_at(elf, 54) as usize, u16_at(elf, 56) as usize);
 
-    let mut space = AddressSpace::new();
+    let mut space = AddressSpace::new().ok_or("out of ASIDs")?;
     let page = mm::PAGE_SIZE as u64;
     for i in 0..phnum {
         let ph =
@@ -182,11 +206,69 @@ fn load(elf: &[u8]) -> Result<(AddressSpace, u64), &'static str> {
     Ok((space, entry))
 }
 
+/// Loads a program and starts it as `name`, writing to the screen lines
+/// `first..first + rows` and holding only `extra` besides them.
+fn launch(
+    name: &'static str,
+    role: u64,
+    arg: u64,
+    first: usize,
+    rows: usize,
+    extra: &[Cap],
+) -> Result<(), &'static str> {
+    let (space, entry) = load(ELF)?;
+    // Registered before the task can run, so its first call finds it.
+    with(|s| {
+        set_line(s, first, String::from("starting"));
+        let mut caps = Vec::from([Cap::Screen { first, rows }]);
+        caps.extend_from_slice(extra);
+        s.programs.push(Program { task: usize::MAX, name, caps: CapTable::new(&caps), first });
+    });
+    let id = task::spawn_user(name, space, entry, STACK_TOP, [role, arg]);
+    with(|s| s.programs.last_mut().unwrap().task = id);
+    Ok(())
+}
+
+fn secret_addr() -> u64 {
+    &KERNEL_SECRET as *const u64 as u64
+}
+
+/// A kernel task that ends at once: its stack is reclaimed like any other.
+fn blip_task() {}
+
+/// Every `RESPAWN_TICKS`, starts `u5` again if it has ended, together with
+/// a short-lived kernel task, and notes the free page count beforehand.
+fn respawn_task() {
+    loop {
+        task::sleep(RESPAWN_TICKS);
+        let (alive, line) = with(|s| (s.programs.iter().any(|p| p.name == "u5"), s.bad_line));
+        if alive {
+            continue;
+        }
+        let free_pages = mm::pages(|p| p.free_pages());
+        task::spawn("blip", blip_task);
+        if let Err(e) = launch("u5", ROLE_BAD, secret_addr(), line, 1, &[]) {
+            with(|s| set_line(s, line, format!("restart failed: {}", e)));
+            return;
+        }
+        with(|s| {
+            s.respawns.count += 1;
+            s.respawns.free_pages = free_pages;
+        });
+    }
+}
+
+/// What `respawn` has done so far.
+pub fn respawns() -> Respawns {
+    with(|s| s.respawns)
+}
+
 /// Starts the demo programs, each with its own lines on screen and only the
-/// capabilities listed for it. Returns (programs, capabilities handed out).
+/// capabilities listed for it, and the task that restarts `u5`. Returns
+/// (programs, capabilities handed out).
 pub fn start() -> Result<(usize, usize), &'static str> {
     arch::allow_fp_at_el0();
-    let secret = &KERNEL_SECRET as *const u64 as u64;
+    let secret = secret_addr();
     let (chan, keys) = with(|s| {
         let keys = s.channels.create(KEY_DEPTH);
         s.keys = Some(keys);
@@ -202,20 +284,19 @@ pub fn start() -> Result<(usize, usize), &'static str> {
         ("u6", ROLE_BUILDER, 0, BUILDER_ROWS, &[Cap::Recv(keys)]),
     ];
     for (name, role, arg, rows, extra) in programs {
-        let (space, entry) = load(ELF)?;
-        // Registered before the task can run, so its first call finds it.
-        with(|s| {
+        let first = with(|s| {
             let first = s.lines.len();
             s.lines.resize(first + rows, String::new());
-            s.lines[first] = String::from("starting");
-            let mut caps = Vec::from([Cap::Screen { first, rows }]);
-            caps.extend_from_slice(extra);
-            s.programs.push(Program { task: usize::MAX, name, caps: CapTable::new(&caps), first });
+            s.labels.resize(first + rows, None);
+            s.labels[first] = Some(name);
+            if role == ROLE_BAD {
+                s.bad_line = first;
+            }
+            first
         });
-        // The address space lives as long as the task: it is never freed.
-        let id = task::spawn_user(name, space.ttbr(), entry, STACK_TOP, [role, arg]);
-        with(|s| s.programs.last_mut().unwrap().task = id);
+        launch(name, role, arg, first, rows, extra)?;
     }
+    task::spawn("respawn", respawn_task);
     Ok(with(|s| (s.programs.len(), s.programs.iter().map(|p| p.caps.len()).sum())))
 }
 
@@ -226,13 +307,7 @@ pub fn elf_size() -> usize {
 /// All user screen lines, each with the name of the program it starts (on
 /// a program's first line only).
 pub fn lines() -> Vec<(Option<&'static str>, String)> {
-    with(|s| {
-        s.lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (s.programs.iter().find(|p| p.first == i).map(|p| p.name), l.clone()))
-            .collect()
-    })
+    with(|s| s.labels.iter().copied().zip(s.lines.iter().cloned()).collect())
 }
 
 /// Changes whenever any user line does.
@@ -263,14 +338,18 @@ fn lookup(s: &State, n: u64) -> (Option<usize>, Option<Cap>) {
     (i, i.and_then(|i| s.programs[i].caps.get(n)))
 }
 
-/// The kernel's own note on the running program's first line (exit, fault).
-fn note(text: String) {
+/// Ends the running program from an exception: `text` goes on its first
+/// line, and its entry and capabilities are dropped before its task is
+/// marked dead, so a later task in the same slot can't inherit them.
+/// Returns the frame to resume instead.
+fn end(f: &mut TrapFrame, text: String) -> *mut TrapFrame {
     with(|s| {
         if let (Some(i), _) = lookup(s, 0) {
-            let first = s.programs[i].first;
-            set_line(s, first, text);
+            let program = s.programs.remove(i);
+            set_line(s, program.first, text);
         }
     });
+    task::exit_from_trap(f)
 }
 
 /// Copies at most `LINE_MAX` bytes of user memory, if EL0 itself could
@@ -297,10 +376,7 @@ fn read_user(ptr: u64, len: u64) -> Option<String> {
 pub fn syscall(f: &mut TrapFrame) -> *mut TrapFrame {
     let (a, b, c, d) = (f.x[0], f.x[1], f.x[2], f.x[3]);
     match f.x[8] {
-        SYS_EXIT => {
-            note(format!("exited ({})", a));
-            return task::exit_from_trap(f);
-        }
+        SYS_EXIT => return end(f, format!("exited ({})", a)),
         SYS_SLEEP => {
             f.x[0] = OK;
             return task::sleep_from_trap(f, a);
@@ -374,6 +450,5 @@ pub fn fault(f: &mut TrapFrame, ec: u64) -> *mut TrapFrame {
         EC_INSTRUCTION_ABORT_EL0 => format!("exec {:#x} {}", f.far, fault_status(iss)),
         _ => exception::ec_name(ec).to_owned(),
     };
-    note(format!("killed: {}", what));
-    task::exit_from_trap(f)
+    end(f, format!("killed: {}", what))
 }

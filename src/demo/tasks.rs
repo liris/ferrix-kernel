@@ -60,6 +60,6 @@ pub fn start() {
         panic!("a worker task never ran: {:?}", progress);
     }
     let names: Vec<&str> = tasks.iter().map(|t| t.name).collect();
-    println!("[task] {} after {} switches", names.join(" "), switches);
+    println!("[task] {}, {} sw", names.join(" "), switches);
     ok(format_args!("M4: {} tasks, round-robin, {} ms slices", tasks.len(), 1000 / irq::TICK_HZ));
 }

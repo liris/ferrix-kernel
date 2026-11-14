@@ -11,6 +11,12 @@
 //! each carries its own address space: a switch loads the next task's TTBR0
 //! when it differs. Kernel tasks all use the kernel's tables.
 //!
+//! A task that ends is only marked `Dead`: it may still be running on its
+//! own kernel stack at that moment. The `reaper` task later takes it out of
+//! the table and drops it, which frees its stack and, for a user task, its
+//! address space (`AddressSpace`'s `Drop`). Its slot, and so its id, is then
+//! free for the next `spawn`.
+//!
 //! The task table is only touched with IRQs masked, which is all the locking
 //! one CPU needs.
 
@@ -18,7 +24,10 @@ use crate::arch;
 use crate::arch::exception::TrapFrame;
 use crate::dev::irq;
 use crate::global::Global;
-use crate::mm::{self, mmu};
+use crate::mm::{
+    self,
+    mmu::{self, AddressSpace},
+};
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::ptr;
@@ -31,6 +40,8 @@ const SPSR_EL1H: u64 = 0b0101;
 const SPSR_EL0T: u64 = 0b0000;
 /// `svc` immediate that asks for a switch.
 pub const SVC_YIELD: u64 = 0;
+/// `wake` tag of the reaper; channel numbers, the other tags, are small.
+const REAP: u64 = u64::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -42,6 +53,30 @@ pub enum State {
     Dead,
 }
 
+/// A task's kernel stack, given back to the page allocator when dropped.
+struct Stack {
+    base: usize,
+}
+
+impl Stack {
+    fn new() -> Self {
+        let base = mm::pages(|pa| pa.alloc(STACK_PAGES)).expect("out of memory for a task stack");
+        Self { base }
+    }
+
+    fn top(&self) -> usize {
+        self.base + STACK_PAGES * mm::PAGE_SIZE
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new`. A `Stack` belongs to one task and is only dropped
+        // with it, by the reaper, once the task is dead and switched away from for good.
+        mm::pages(|pa| unsafe { pa.free(self.base, STACK_PAGES) });
+    }
+}
+
 struct Task {
     name: &'static str,
     state: State,
@@ -51,17 +86,38 @@ struct Task {
     ticks: u64,
     /// Its address space.
     ttbr: u64,
+    /// `None` for `main`, which runs on the boot stack.
+    #[expect(dead_code, reason = "only held, to be freed when the reaper drops the task")]
+    stack: Option<Stack>,
+    /// A user task's address space; `ttbr` selects it.
+    #[expect(dead_code, reason = "only held, to be freed when the reaper drops the task")]
+    space: Option<AddressSpace>,
 }
 
 // SAFETY: `frame` points into the task's own kernel stack, used only by the scheduler and
-// the exception path while this task isn't running.
+// the exception path while this task isn't running. `space` is reached only through the
+// task, which the scheduler owns.
 unsafe impl Send for Task {}
 
 struct Scheduler {
-    tasks: Vec<Task>,
+    /// Indexed by task id; `None` is a free slot.
+    tasks: Vec<Option<Task>>,
     current: usize,
     idle: usize,
     switches: u64,
+    reaped: u64,
+}
+
+impl Scheduler {
+    /// The live task `id`. Panics on a free slot: ids handed out are live
+    /// until the reaper takes them, and nobody keeps one past that.
+    fn task(&mut self, id: usize) -> &mut Task {
+        self.tasks[id].as_mut().expect("no task in this slot")
+    }
+
+    fn is_ready(&self, id: usize) -> bool {
+        self.tasks[id].as_ref().is_some_and(|t| t.state == State::Ready)
+    }
 }
 
 static SCHED: Global<Scheduler> = Global::new("scheduler");
@@ -70,36 +126,64 @@ fn with<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
     SCHED.with(f)
 }
 
-/// Turns the running code into task 0, `main`, and adds the idle task.
+/// Turns the running code into task 0, `main`, and adds the idle task and
+/// the reaper.
 pub fn init() {
-    let ttbr = mmu::kernel_ttbr();
-    let main = Task { name: "main", state: State::Ready, frame: ptr::null_mut(), ticks: 0, ttbr };
-    SCHED.set(Scheduler { tasks: alloc::vec![main], current: 0, idle: 0, switches: 0 });
+    let main = Task {
+        name: "main",
+        state: State::Ready,
+        frame: ptr::null_mut(),
+        ticks: 0,
+        ttbr: mmu::kernel_ttbr(),
+        stack: None,
+        space: None,
+    };
+    SCHED.set(Scheduler {
+        tasks: alloc::vec![Some(main)],
+        current: 0,
+        idle: 0,
+        switches: 0,
+        reaped: 0,
+    });
     let idle = spawn("idle", idle_task);
     with(|s| s.idle = idle);
+    spawn("reap", reaper_task);
 }
 
-/// Allocates a kernel stack holding a zeroed frame for a new task.
-fn new_frame() -> *mut TrapFrame {
-    let stack = mm::pages(|pa| pa.alloc(STACK_PAGES)).expect("out of memory for a task stack");
-    let top = stack + STACK_PAGES * mm::PAGE_SIZE;
+/// A fresh kernel stack with a zeroed frame on top.
+fn new_stack() -> (Stack, *mut TrapFrame) {
+    let stack = Stack::new();
     // 816 bytes keeps sp 16-aligned.
-    let frame = (top - size_of::<TrapFrame>()) as *mut TrapFrame;
+    let frame = (stack.top() - size_of::<TrapFrame>()) as *mut TrapFrame;
     // SAFETY: the top of a stack just allocated for this task; an all-zero frame is valid.
     unsafe { ptr::write_bytes(frame, 0, 1) };
-    frame
+    (stack, frame)
 }
 
-fn add(name: &'static str, frame: *mut TrapFrame, ttbr: u64) -> usize {
-    with(|s| {
-        s.tasks.push(Task { name, state: State::Ready, frame, ticks: 0, ttbr });
-        s.tasks.len() - 1
+/// Puts a ready task in the first free slot; its index is the task's id.
+fn add(
+    name: &'static str,
+    stack: Stack,
+    frame: *mut TrapFrame,
+    space: Option<AddressSpace>,
+) -> usize {
+    let ttbr = space.as_ref().map_or_else(mmu::kernel_ttbr, AddressSpace::ttbr);
+    let task = Task { name, state: State::Ready, frame, ticks: 0, ttbr, stack: Some(stack), space };
+    with(|s| match s.tasks.iter().position(Option::is_none) {
+        Some(id) => {
+            s.tasks[id] = Some(task);
+            id
+        }
+        None => {
+            s.tasks.push(Some(task));
+            s.tasks.len() - 1
+        }
     })
 }
 
 /// Creates a ready task that runs `entry` on a fresh stack. Returns its id.
 pub fn spawn(name: &'static str, entry: fn()) -> usize {
-    let frame = new_frame();
+    let (stack, frame) = new_stack();
     // SAFETY: a fresh frame that no task uses yet.
     unsafe {
         // A frame that "returns" into task_start(entry).
@@ -107,14 +191,21 @@ pub fn spawn(name: &'static str, entry: fn()) -> usize {
         (*frame).elr = task_start as extern "C" fn(usize) -> ! as usize as u64;
         (*frame).spsr = SPSR_EL1H;
     }
-    add(name, frame, mmu::kernel_ttbr())
+    add(name, stack, frame, None)
 }
 
-/// Creates a ready user task that starts at `entry` at EL0 in the address
-/// space `ttbr`, on the user stack `sp`, with `args` in x0 and x1. Its
-/// exceptions are taken on a kernel stack of its own. Returns its id.
-pub fn spawn_user(name: &'static str, ttbr: u64, entry: u64, sp: u64, args: [u64; 2]) -> usize {
-    let frame = new_frame();
+/// Creates a ready user task that starts at `entry` at EL0 in `space`, on
+/// the user stack `sp`, with `args` in x0 and x1. Its exceptions are taken
+/// on a kernel stack of its own. The task owns `space` from now on, and the
+/// reaper frees it after the task ends. Returns its id.
+pub fn spawn_user(
+    name: &'static str,
+    space: AddressSpace,
+    entry: u64,
+    sp: u64,
+    args: [u64; 2],
+) -> usize {
+    let (stack, frame) = new_stack();
     // SAFETY: a fresh frame that no task uses yet.
     unsafe {
         (*frame).x[0] = args[0];
@@ -123,7 +214,7 @@ pub fn spawn_user(name: &'static str, ttbr: u64, entry: u64, sp: u64, args: [u64
         (*frame).sp_el0 = sp;
         (*frame).spsr = SPSR_EL0T;
     }
-    add(name, frame, ttbr)
+    add(name, stack, frame, Some(space))
 }
 
 /// Id of the running task.
@@ -136,7 +227,7 @@ pub fn current() -> usize {
 pub fn sleep_from_trap(frame: *mut TrapFrame, ticks: u64) -> *mut TrapFrame {
     with(|s| {
         let me = s.current;
-        s.tasks[me].state = State::Sleeping(irq::ticks() + ticks);
+        s.task(me).state = State::Sleeping(irq::ticks() + ticks);
     });
     switch(frame, false)
 }
@@ -146,7 +237,7 @@ pub fn sleep_from_trap(frame: *mut TrapFrame, ticks: u64) -> *mut TrapFrame {
 pub fn block_from_trap(frame: *mut TrapFrame, tag: u64) -> *mut TrapFrame {
     with(|s| {
         let me = s.current;
-        s.tasks[me].state = State::Blocked(tag);
+        s.task(me).state = State::Blocked(tag);
     });
     switch(frame, false)
 }
@@ -154,7 +245,7 @@ pub fn block_from_trap(frame: *mut TrapFrame, tag: u64) -> *mut TrapFrame {
 /// Makes every task blocked on `tag` ready again.
 pub fn wake(tag: u64) {
     with(|s| {
-        for t in &mut s.tasks {
+        for t in s.tasks.iter_mut().flatten() {
             if t.state == State::Blocked(tag) {
                 t.state = State::Ready;
             }
@@ -162,13 +253,20 @@ pub fn wake(tag: u64) {
     });
 }
 
-/// From an exception: ends the running task for good and returns the frame
-/// to resume instead. Its memory is not reclaimed.
-pub fn exit_from_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
+/// Marks the running task dead and wakes the reaper, which frees it once
+/// it has been switched away from.
+fn mark_dead() {
     with(|s| {
         let me = s.current;
-        s.tasks[me].state = State::Dead;
+        s.task(me).state = State::Dead;
     });
+    wake(REAP);
+}
+
+/// From an exception: ends the running task for good and returns the frame
+/// to resume instead.
+pub fn exit_from_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
+    mark_dead();
     switch(frame, false)
 }
 
@@ -177,11 +275,8 @@ extern "C" fn task_start(entry: usize) -> ! {
     // SAFETY: `spawn` stored a `fn()` here.
     let entry: fn() = unsafe { core::mem::transmute(entry) };
     entry();
-    // Its stack is still in use right here, so it is never freed.
-    with(|s| {
-        let me = s.current;
-        s.tasks[me].state = State::Dead;
-    });
+    // Still on its stack here: the reaper frees it only after the switch.
+    mark_dead();
     yield_now();
     unreachable!("a dead task was resumed");
 }
@@ -189,6 +284,40 @@ extern "C" fn task_start(entry: usize) -> ! {
 fn idle_task() {
     loop {
         arch::wait_for_interrupt();
+    }
+}
+
+/// Takes the dead tasks out of the table, then drops them, which frees
+/// their stacks and address spaces. Blocks while there are none.
+///
+/// A dead task is never current here (the reaper is), and is never picked
+/// again, so nothing runs on its stack or in its address space any more.
+fn reaper_task() {
+    loop {
+        // Masked from the check to the block, so a `wake(REAP)` in between
+        // isn't lost.
+        let dead: Vec<Task> = arch::without_irqs(|| {
+            let dead = with(|s| {
+                let dead: Vec<Task> = s
+                    .tasks
+                    .iter_mut()
+                    .filter(|t| t.as_ref().is_some_and(|t| t.state == State::Dead))
+                    .filter_map(Option::take)
+                    .collect();
+                s.reaped += dead.len() as u64;
+                dead
+            });
+            if dead.is_empty() {
+                with(|s| {
+                    let me = s.current;
+                    s.task(me).state = State::Blocked(REAP);
+                });
+                yield_now();
+            }
+            dead
+        });
+        // Dropped with IRQs on: freeing an address space walks its tables.
+        drop(dead);
     }
 }
 
@@ -204,7 +333,7 @@ pub fn sleep(ticks: u64) {
     arch::without_irqs(|| {
         with(|s| {
             let me = s.current;
-            s.tasks[me].state = State::Sleeping(irq::ticks() + ticks);
+            s.task(me).state = State::Sleeping(irq::ticks() + ticks);
         });
         yield_now();
     });
@@ -221,11 +350,11 @@ pub fn switch(frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame {
 fn pick(s: &mut Scheduler, frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame {
     let now = irq::ticks();
     let me = s.current;
-    s.tasks[me].frame = frame;
+    s.task(me).frame = frame;
     if tick {
-        s.tasks[me].ticks += 1;
+        s.task(me).ticks += 1;
     }
-    for t in &mut s.tasks {
+    for t in s.tasks.iter_mut().flatten() {
         if let State::Sleeping(until) = t.state
             && now >= until
         {
@@ -235,19 +364,19 @@ fn pick(s: &mut Scheduler, frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame 
 
     // Round-robin starting after the current task; idle only if nobody else.
     let n = s.tasks.len();
-    let next = (1..=n)
-        .map(|i| (me + i) % n)
-        .find(|&i| i != s.idle && s.tasks[i].state == State::Ready)
-        .unwrap_or(s.idle);
+    let next =
+        (1..=n).map(|i| (me + i) % n).find(|&i| i != s.idle && s.is_ready(i)).unwrap_or(s.idle);
     if next != me {
         s.switches += 1;
-        if s.tasks[next].ttbr != s.tasks[me].ttbr {
-            // SAFETY: task TTBRs come from `kernel_ttbr` or a live `AddressSpace`.
-            unsafe { mmu::set_ttbr0(s.tasks[next].ttbr) };
+        let ttbr = s.task(next).ttbr;
+        if ttbr != s.task(me).ttbr {
+            // SAFETY: task TTBRs come from `kernel_ttbr` or the task's own `AddressSpace`,
+            // which lives as long as the task.
+            unsafe { mmu::set_ttbr0(ttbr) };
         }
     }
     s.current = next;
-    s.tasks[next].frame
+    s.task(next).frame
 }
 
 pub struct TaskInfo {
@@ -255,10 +384,17 @@ pub struct TaskInfo {
     pub ticks: u64,
 }
 
-/// Per-task tick counts and the total number of switches so far.
+/// Per-task tick counts of the live tasks and the total number of switches
+/// so far.
 pub fn snapshot() -> (Vec<TaskInfo>, u64) {
     with(|s| {
-        let tasks = s.tasks.iter().map(|t| TaskInfo { name: t.name, ticks: t.ticks }).collect();
+        let tasks =
+            s.tasks.iter().flatten().map(|t| TaskInfo { name: t.name, ticks: t.ticks }).collect();
         (tasks, s.switches)
     })
+}
+
+/// How many tasks the reaper has freed so far.
+pub fn reaped() -> u64 {
+    with(|s| s.reaped)
 }

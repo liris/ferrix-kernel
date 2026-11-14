@@ -8,6 +8,7 @@ use crate::demo::tasks;
 use crate::dev::console::{self, DIM, ERR, FG};
 use crate::dev::irq;
 use crate::dev::usb::keyboard;
+use crate::mm::mmu;
 use crate::proc::{task, user};
 use crate::{print, println};
 use alloc::format;
@@ -74,6 +75,22 @@ fn task_status(line: usize) {
     );
 }
 
+/// What the reaper has freed, and the free page count each time `u5` is
+/// restarted: it stays put if ended programs leave nothing behind.
+fn reap_status(line: usize) {
+    let r = user::respawns();
+    status_line(
+        line,
+        format_args!(
+            "reaped {}  u5 x{}  free {}  asid {}",
+            task::reaped(),
+            r.count,
+            r.free_pages,
+            mmu::asids_in_use()
+        ),
+    );
+}
+
 /// Ticks between redraws of the task lines (10 per second).
 const TASK_REDRAW_TICKS: u64 = irq::TICK_HZ / 10;
 
@@ -112,10 +129,10 @@ pub fn interrupt_loop(keyboard: bool, builder: bool) -> ! {
     let mut lab = Lab::new();
     println!("[lab ] counter {} NAND, adder {} NAND", lab.counter_gates(), lab.adder_gates());
     // Reserve a blank spacer, then rows for uptime, counter, adder, two task
-    // lines, the user programs' lines and key help. Rows are taken relative
+    // lines, the reaper's line, the user programs' lines and key help. Rows are taken relative
     // to the cursor, which stays valid if the screen scrolls.
     let user_rows = user::lines().len();
-    let rows = 6 + user_rows;
+    let rows = 7 + user_rows;
     for _ in 0..rows {
         println!();
     }
@@ -155,7 +172,7 @@ pub fn interrupt_loop(keyboard: bool, builder: bool) -> ! {
         if user::generation() != generation {
             generation = user::generation();
             for (i, (name, text)) in user::lines().iter().enumerate() {
-                status_line(line + 5 + i, format_args!("{:<2} {}", name.unwrap_or(""), text));
+                status_line(line + 6 + i, format_args!("{:<2} {}", name.unwrap_or(""), text));
             }
         }
 
@@ -166,6 +183,7 @@ pub fn interrupt_loop(keyboard: bool, builder: bool) -> ! {
                 drawn = t / TASK_REDRAW_TICKS;
                 uptime(line, t / irq::TICK_HZ);
                 task_status(line + 3);
+                reap_status(line + 5);
             }
             if lab.timer_clock((t / HALF_PERIOD_TICKS) % 2 == 1) {
                 status_line(line + 1, format_args!("{}", lab.counter_line()));

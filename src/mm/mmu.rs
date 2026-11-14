@@ -20,13 +20,14 @@
 //! shared, plus one entry of their own for `USER_BASE..USER_END`. Kernel
 //! mappings are EL1-only and global; user mappings are not global and are
 //! tagged with the space's ASID, so switching TTBR0 between tasks needs no
-//! TLB invalidation.
+//! TLB invalidation. Dropping a space frees its pages and tables and
+//! invalidates its ASID's TLB entries (`tlbi aside1`), so the ASID can be
+//! handed out again.
 
 use crate::global::Global;
 use crate::mm::{self, PAGE_SIZE};
 use core::arch::asm;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 const ENTRIES: usize = 512;
 
@@ -265,8 +266,54 @@ pub fn map_live(start: u64, len: u64, kind: Kind) {
 pub const USER_BASE: u64 = 0x4000_0000_0000;
 pub const USER_END: u64 = USER_BASE + (1 << 39);
 
-/// ASID 0 is the kernel's; user spaces count up from 1, never reused.
-static NEXT_ASID: AtomicU64 = AtomicU64::new(1);
+/// 8-bit ASIDs (TCR_EL1.AS = 0). ASID 0 is the kernel's.
+const ASIDS: usize = 256;
+
+/// ASIDs held by live user spaces, one bit each; bit 0 is never set.
+static ASIDS_USED: Global<[u64; ASIDS / 64]> = Global::new("ASIDs");
+
+fn alloc_asid() -> Option<u64> {
+    ASIDS_USED.with_default(|used| {
+        let asid = (1..ASIDS).find(|&a| used[a / 64] & 1 << (a % 64) == 0)?;
+        used[asid / 64] |= 1 << (asid % 64);
+        Some(asid as u64)
+    })
+}
+
+/// ASIDs held by user address spaces right now.
+pub fn asids_in_use() -> usize {
+    ASIDS_USED.with_default(|used| used.iter().map(|w| w.count_ones() as usize).sum())
+}
+
+/// Frees the level `level` table at `table`, everything below it, and the
+/// pages its leaf entries map.
+///
+/// # Safety
+///
+/// `table` must be a user table from `new_table` that no live address space reaches, and
+/// the pages its entries map must belong to that space alone (as `AddressSpace::map`
+/// requires).
+unsafe fn free_user_table(table: *mut u64, level: usize) {
+    for i in 0..ENTRIES {
+        // SAFETY: a whole table page (caller).
+        let entry = unsafe { *table.add(i) };
+        if entry & DESC_VALID == 0 {
+            continue;
+        }
+        let addr = (entry & DESC_ADDR) as usize;
+        if level < 3 && entry & DESC_TABLE_OR_PAGE != 0 {
+            // SAFETY: a table below ours, made by `map_level` for this space.
+            unsafe { free_user_table(addr as *mut u64, level + 1) };
+        } else {
+            // A page, or a block of 512^(3 - level) pages.
+            let count = 1 << (9 * (3 - level));
+            // SAFETY: pages the space owned (caller), allocated by `alloc_zeroed` in runs.
+            mm::pages(|pa| unsafe { pa.free(addr, count) });
+        }
+    }
+    // SAFETY: the table page itself, from `new_table`, now unreferenced.
+    mm::pages(|pa| unsafe { pa.free(table as usize, 1) });
+}
 
 /// A user program's address space: the kernel's mappings (EL1-only) plus its
 /// own pages in the user range.
@@ -278,7 +325,9 @@ pub struct AddressSpace {
 impl AddressSpace {
     /// Shares the kernel's tables as they are now. The kernel must not map
     /// new level 0 ranges afterwards (all of its mappings sit in entry 0).
-    pub fn new() -> Self {
+    /// `None` when all ASIDs are in use.
+    pub fn new() -> Option<Self> {
+        let asid = alloc_asid()?;
         let kernel = kernel_ttbr() as *const u64;
         let root = new_table(&mut Stats::default());
         let user = (USER_BASE >> 39) as usize;
@@ -287,9 +336,7 @@ impl AddressSpace {
             ptr::copy_nonoverlapping(kernel, root, ENTRIES);
             assert!(*root.add(user) & DESC_VALID == 0, "kernel maps the user range");
         }
-        let asid = NEXT_ASID.fetch_add(1, Ordering::Relaxed);
-        assert!(asid < 256, "out of ASIDs");
-        Self { root, asid }
+        Some(Self { root, asid })
     }
 
     /// Maps user pages `[va, va + len)` to physical `pa` onwards.
@@ -313,6 +360,40 @@ impl AddressSpace {
     /// TTBR0_EL1 value selecting this space.
     pub fn ttbr(&self) -> u64 {
         self.root as u64 | self.asid << 48
+    }
+}
+
+impl Drop for AddressSpace {
+    /// Frees the user pages and tables, then the root, and returns the ASID.
+    /// The space must not be in TTBR0: its task is dead and switched away
+    /// from, or it never ran.
+    fn drop(&mut self) {
+        assert!(ttbr0() != self.ttbr(), "freeing the address space in use");
+        let user = (USER_BASE >> 39) as usize;
+        // SAFETY: TLB maintenance only. No TTBR0 selects this ASID, so nothing refills
+        // the entries dropped here before the ASID is handed out again below.
+        unsafe {
+            asm!(
+                "dsb ishst",
+                "tlbi aside1, {}",
+                "dsb ish",
+                "isb",
+                in(reg) self.asid << 48,
+                options(nostack),
+            )
+        };
+        // SAFETY: `root` is ours. Its user entry leads to tables made by `map` for this
+        // space alone, over pages handed to it; the other entries are the kernel's and
+        // are left alone. Nothing reaches the root any more (checked above).
+        unsafe {
+            let entry = *self.root.add(user);
+            if entry & DESC_VALID != 0 {
+                free_user_table((entry & DESC_ADDR) as *mut u64, 1);
+            }
+            mm::pages(|pa| pa.free(self.root as usize, 1));
+        }
+        let asid = self.asid as usize;
+        ASIDS_USED.with_default(|used| used[asid / 64] &= !(1 << (asid % 64)));
     }
 }
 
