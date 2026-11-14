@@ -252,7 +252,7 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) -> *mut TrapFra
     // IRQ taken in the kernel (EL1, either stack pointer) or in a user task.
     if kind == 1 || kind == 5 || kind == KIND_EL0_IRQ {
         let ticked = crate::dev::irq::handle();
-        return if ticked { crate::proc::task::switch(frame, true) } else { frame };
+        return if ticked { crate::proc::task::switch(frame) } else { frame };
     }
 
     if kind == KIND_EL0_SYNC {
@@ -270,7 +270,7 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) -> *mut TrapFra
         return frame;
     }
     if is_sync && ec == EC_SVC64 && iss & 0xffff == crate::proc::task::SVC_YIELD {
-        return crate::proc::task::switch(frame, false);
+        return crate::proc::task::switch(frame);
     }
     if is_sync && ec == EC_SVC64 {
         crate::println!("[exc ] svc #{:#x} (x0={:#x}), returning", iss & 0xffff, frame.x[0]);

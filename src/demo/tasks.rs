@@ -4,7 +4,7 @@
 use crate::dev::irq;
 use crate::ok;
 use crate::println;
-use crate::proc::task;
+use crate::proc::task::{self, Weight};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nand::Adder4;
@@ -50,9 +50,13 @@ fn fpu_task() {
 /// workers never yield) and that every worker has made progress.
 pub fn start() {
     task::init();
-    task::spawn("spin", spin_task);
+    // Weights 1 : 2 : 4 (and 8 for `u2`), so their CPU shares show the
+    // scheduler at work.
+    let spin = task::spawn("spin", spin_task);
     task::spawn("nand", nand_task);
-    task::spawn("fpu", fpu_task);
+    let fpu = task::spawn("fpu", fpu_task);
+    task::set_weight(spin, Weight::Low);
+    task::set_weight(fpu, Weight::High);
     task::sleep(irq::TICK_HZ / 5);
     let (tasks, switches) = task::snapshot();
     let progress = [&SPIN_COUNT, &NAND_ROUNDS, &FPU_ROUNDS].map(|c| c.load(Ordering::Relaxed));
@@ -61,5 +65,5 @@ pub fn start() {
     }
     let names: Vec<&str> = tasks.iter().map(|t| t.name).collect();
     println!("[task] {}, {} sw", names.join(" "), switches);
-    ok(format_args!("M4: {} tasks, round-robin, {} ms slices", tasks.len(), 1000 / irq::TICK_HZ));
+    ok(format_args!("M4: {} tasks, weighted fair, {} ms ticks", tasks.len(), 1000 / irq::TICK_HZ));
 }

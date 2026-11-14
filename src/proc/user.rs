@@ -46,7 +46,7 @@ use crate::arch::exception::{self, TrapFrame};
 use crate::global::Global;
 use crate::mm::mmu::{self, AddressSpace, Kind};
 use crate::proc::cap::{Cap, CapTable, Channels, Msg};
-use crate::proc::task;
+use crate::proc::task::{self, Weight};
 use crate::{arch, mm};
 use alloc::borrow::ToOwned;
 use alloc::format;
@@ -229,7 +229,8 @@ fn reserve(s: &mut State, label: Option<&'static str>, rows: usize) -> usize {
 }
 
 /// Loads a program and starts it as `name`, writing to the screen lines
-/// `first..first + rows` and holding only `extra` besides them.
+/// `first..first + rows` and holding only `extra` besides them. Returns its
+/// task id.
 fn launch(
     name: &'static str,
     role: u64,
@@ -237,7 +238,7 @@ fn launch(
     first: usize,
     rows: usize,
     extra: &[Cap],
-) -> Result<(), &'static str> {
+) -> Result<usize, &'static str> {
     let (space, entry) = load(ELF)?;
     // Registered before the task can run, so its first call finds it.
     with(|s| {
@@ -248,7 +249,7 @@ fn launch(
     });
     let id = task::spawn_user(name, space, entry, STACK_TOP, [role, arg]);
     with(|s| s.programs.last_mut().unwrap().task = id);
-    Ok(())
+    Ok(id)
 }
 
 fn secret_addr() -> u64 {
@@ -313,7 +314,11 @@ pub fn start() -> Result<(usize, usize, usize), &'static str> {
         if role == ROLE_BAD {
             with(|s| s.bad_line = first);
         }
-        launch(name, role, arg, first, rows, extra)?;
+        let id = launch(name, role, arg, first, rows, extra)?;
+        if role == ROLE_SPIN {
+            // The heaviest of the busy tasks, at EL0 (`demo::tasks` has the others).
+            task::set_weight(id, Weight::Highest);
+        }
     }
     task::spawn("respawn", respawn_task);
     Ok(with(|s| {

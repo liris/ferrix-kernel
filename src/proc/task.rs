@@ -1,11 +1,21 @@
-//! Preemptive round-robin scheduling of kernel tasks (single CPU).
+//! Preemptive, weighted fair scheduling of tasks (single CPU).
 //!
 //! Every task runs at EL1 on its own stack. Switches only happen inside an
 //! exception: the vector has already pushed a full `TrapFrame` onto the
 //! running task's stack, so switching means remembering that frame and
 //! handing another task's frame to the exit path, which restores it and
-//! `eret`s into that task. The timer IRQ switches on every tick (preemption);
-//! `svc #0` switches on request (`yield_now`, `sleep`).
+//! `eret`s into that task. The timer IRQ offers a switch on every tick
+//! (preemption); `svc #0` switches on request (`yield_now`, `sleep`).
+//!
+//! Which task (M10d): each has a `Weight`, and a virtual runtime that grows
+//! by the time it runs (measured with `CNTVCT` at every switch) divided by
+//! its weight. The ready task with the least virtual runtime runs next, so
+//! CPU time is shared in proportion to weight and nobody starves (stride
+//! scheduling; Linux's CFS works the same way). A task that slept falls
+//! behind and so runs first once it wakes, but its virtual runtime is raised
+//! to at most `WAKE_CREDIT` behind the least of the others, so a long sleep
+//! doesn't buy it the CPU for long. The idle task runs only when nobody else
+//! is ready.
 //!
 //! User tasks (M7) are the same, except that their frame returns to EL0 and
 //! each carries its own address space: a switch loads the next task's TTBR0
@@ -42,6 +52,17 @@ const SPSR_EL0T: u64 = 0b0000;
 pub const SVC_YIELD: u64 = 0;
 /// `wake` tag of the reaper; channel numbers, the other tags, are small.
 const REAP: u64 = u64::MAX;
+/// Virtual runtime is runtime × `VR_SCALE` / weight, kept in integers.
+const VR_SCALE: u64 = 8;
+
+/// A task's share of the CPU: twice the weight, twice the time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Weight {
+    Low = 1,
+    Normal = 2,
+    High = 4,
+    Highest = 8,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -82,8 +103,13 @@ struct Task {
     state: State,
     /// Where its registers were saved when it last stopped running.
     frame: *mut TrapFrame,
-    /// Timer ticks that landed while this task was running.
-    ticks: u64,
+    /// Time it has run, in `CNTVCT` counts.
+    runtime: u64,
+    /// Runtime scaled by `VR_SCALE` / weight; the least runs next.
+    vruntime: u64,
+    weight: Weight,
+    /// When `wake` made it ready, until it runs.
+    woken_at: Option<u64>,
     /// Its address space.
     ttbr: u64,
     /// `None` for `main`, which runs on the boot stack.
@@ -99,6 +125,14 @@ struct Task {
 // task, which the scheduler owns.
 unsafe impl Send for Task {}
 
+/// Time from `wake` to running, over all wakes so far, in `CNTVCT` counts.
+#[derive(Default, Clone, Copy)]
+struct WakeStats {
+    count: u64,
+    total: u64,
+    max: u64,
+}
+
 struct Scheduler {
     /// Indexed by task id; `None` is a free slot.
     tasks: Vec<Option<Task>>,
@@ -106,6 +140,14 @@ struct Scheduler {
     idle: usize,
     switches: u64,
     reaped: u64,
+    /// `CNTVCT` when the current task started running.
+    started: u64,
+    /// The least virtual runtime of the ready tasks; never goes back.
+    min_vruntime: u64,
+    /// How far behind `min_vruntime` a waking task may stay: one tick of
+    /// running at `Weight::Normal`.
+    wake_credit: u64,
+    wakes: WakeStats,
 }
 
 impl Scheduler {
@@ -118,6 +160,26 @@ impl Scheduler {
     fn is_ready(&self, id: usize) -> bool {
         self.tasks[id].as_ref().is_some_and(|t| t.state == State::Ready)
     }
+
+    /// The least virtual runtime a task becoming ready keeps.
+    fn wake_floor(&self) -> u64 {
+        self.min_vruntime.saturating_sub(self.wake_credit)
+    }
+}
+
+fn new_task(name: &'static str, frame: *mut TrapFrame, vruntime: u64) -> Task {
+    Task {
+        name,
+        state: State::Ready,
+        frame,
+        runtime: 0,
+        vruntime,
+        weight: Weight::Normal,
+        woken_at: None,
+        ttbr: mmu::kernel_ttbr(),
+        stack: None,
+        space: None,
+    }
 }
 
 static SCHED: Global<Scheduler> = Global::new("scheduler");
@@ -129,21 +191,18 @@ fn with<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
 /// Turns the running code into task 0, `main`, and adds the idle task and
 /// the reaper.
 pub fn init() {
-    let main = Task {
-        name: "main",
-        state: State::Ready,
-        frame: ptr::null_mut(),
-        ticks: 0,
-        ttbr: mmu::kernel_ttbr(),
-        stack: None,
-        space: None,
-    };
+    let main = new_task("main", ptr::null_mut(), 0);
+    let tick = arch::timer_freq() / irq::TICK_HZ;
     SCHED.set(Scheduler {
         tasks: alloc::vec![Some(main)],
         current: 0,
         idle: 0,
         switches: 0,
         reaped: 0,
+        started: arch::timer_count(),
+        min_vruntime: 0,
+        wake_credit: tick * VR_SCALE / Weight::Normal as u64,
+        wakes: WakeStats::default(),
     });
     let idle = spawn("idle", idle_task);
     with(|s| s.idle = idle);
@@ -161,6 +220,7 @@ fn new_stack() -> (Stack, *mut TrapFrame) {
 }
 
 /// Puts a ready task in the first free slot; its index is the task's id.
+/// It starts level with the least virtual runtime, neither ahead nor behind.
 fn add(
     name: &'static str,
     stack: Stack,
@@ -168,8 +228,15 @@ fn add(
     space: Option<AddressSpace>,
 ) -> usize {
     let ttbr = space.as_ref().map_or_else(mmu::kernel_ttbr, AddressSpace::ttbr);
-    let task = Task { name, state: State::Ready, frame, ticks: 0, ttbr, stack: Some(stack), space };
-    with(|s| match s.tasks.iter().position(Option::is_none) {
+    with(|s| {
+        let task =
+            Task { ttbr, stack: Some(stack), space, ..new_task(name, frame, s.min_vruntime) };
+        place(s, task)
+    })
+}
+
+fn place(s: &mut Scheduler, task: Task) -> usize {
+    match s.tasks.iter().position(Option::is_none) {
         Some(id) => {
             s.tasks[id] = Some(task);
             id
@@ -178,7 +245,12 @@ fn add(
             s.tasks.push(Some(task));
             s.tasks.len() - 1
         }
-    })
+    }
+}
+
+/// Sets the share of the CPU task `id` gets from now on.
+pub fn set_weight(id: usize, weight: Weight) {
+    with(|s| s.task(id).weight = weight);
 }
 
 /// Creates a ready task that runs `entry` on a fresh stack. Returns its id.
@@ -229,7 +301,7 @@ pub fn sleep_from_trap(frame: *mut TrapFrame, ticks: u64) -> *mut TrapFrame {
         let me = s.current;
         s.task(me).state = State::Sleeping(irq::ticks() + ticks);
     });
-    switch(frame, false)
+    switch(frame)
 }
 
 /// From an exception: blocks the running task until `wake(tag)` and
@@ -239,15 +311,20 @@ pub fn block_from_trap(frame: *mut TrapFrame, tag: u64) -> *mut TrapFrame {
         let me = s.current;
         s.task(me).state = State::Blocked(tag);
     });
-    switch(frame, false)
+    switch(frame)
 }
 
-/// Makes every task blocked on `tag` ready again.
+/// Makes every task blocked on `tag` ready again. It runs before the tasks
+/// that kept running meanwhile, from the next switch on.
 pub fn wake(tag: u64) {
+    let now = arch::timer_count();
     with(|s| {
+        let floor = s.wake_floor();
         for t in s.tasks.iter_mut().flatten() {
             if t.state == State::Blocked(tag) {
                 t.state = State::Ready;
+                t.vruntime = t.vruntime.max(floor);
+                t.woken_at = Some(now);
             }
         }
     });
@@ -267,7 +344,7 @@ fn mark_dead() {
 /// to resume instead.
 pub fn exit_from_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
     mark_dead();
-    switch(frame, false)
+    switch(frame)
 }
 
 /// First code of every spawned task; x0 holds the `fn()` from `spawn`.
@@ -341,31 +418,50 @@ pub fn sleep(ticks: u64) {
 
 /// Called from the exception path with IRQs masked: saves `frame` as the
 /// running task's state and returns the frame of the task to run next.
-/// `tick` charges the tick that caused the call to the running task.
-pub fn switch(frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame {
+pub fn switch(frame: *mut TrapFrame) -> *mut TrapFrame {
     // Ticks before `init` keep running whatever was interrupted.
-    SCHED.try_with(|s| pick(s, frame, tick)).unwrap_or(frame)
+    SCHED.try_with(|s| pick(s, frame)).unwrap_or(frame)
 }
 
-fn pick(s: &mut Scheduler, frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame {
-    let now = irq::ticks();
+fn pick(s: &mut Scheduler, frame: *mut TrapFrame) -> *mut TrapFrame {
+    let now = arch::timer_count();
     let me = s.current;
-    s.task(me).frame = frame;
-    if tick {
-        s.task(me).ticks += 1;
-    }
+    let ran = now - s.started;
+    s.started = now;
+    let t = s.task(me);
+    t.frame = frame;
+    t.runtime += ran;
+    t.vruntime += ran * VR_SCALE / t.weight as u64;
+
+    let tick = irq::ticks();
+    let floor = s.wake_floor();
     for t in s.tasks.iter_mut().flatten() {
         if let State::Sleeping(until) = t.state
-            && now >= until
+            && tick >= until
         {
             t.state = State::Ready;
+            t.vruntime = t.vruntime.max(floor);
         }
     }
 
-    // Round-robin starting after the current task; idle only if nobody else.
+    // The least virtual runtime wins; among equals, the first after the
+    // current task (round-robin). Idle only if nobody else is ready.
     let n = s.tasks.len();
-    let next =
-        (1..=n).map(|i| (me + i) % n).find(|&i| i != s.idle && s.is_ready(i)).unwrap_or(s.idle);
+    let vruntime = |s: &Scheduler, i: usize| s.tasks[i].as_ref().map_or(u64::MAX, |t| t.vruntime);
+    let next = (1..=n)
+        .map(|i| (me + i) % n)
+        .filter(|&i| i != s.idle && s.is_ready(i))
+        .min_by_key(|&i| vruntime(s, i))
+        .unwrap_or(s.idle);
+    if next != s.idle {
+        s.min_vruntime = s.min_vruntime.max(vruntime(s, next));
+    }
+    if let Some(at) = s.task(next).woken_at.take() {
+        let w = &mut s.wakes;
+        w.count += 1;
+        w.total += now - at;
+        w.max = w.max.max(now - at);
+    }
     if next != me {
         s.switches += 1;
         let ttbr = s.task(next).ttbr;
@@ -381,17 +477,29 @@ fn pick(s: &mut Scheduler, frame: *mut TrapFrame, tick: bool) -> *mut TrapFrame 
 
 pub struct TaskInfo {
     pub name: &'static str,
-    pub ticks: u64,
+    /// Time it has run, in `CNTVCT` counts.
+    pub runtime: u64,
 }
 
-/// Per-task tick counts of the live tasks and the total number of switches
-/// so far.
+/// Per-task runtime of the live tasks and the total number of switches so
+/// far.
 pub fn snapshot() -> (Vec<TaskInfo>, u64) {
     with(|s| {
-        let tasks =
-            s.tasks.iter().flatten().map(|t| TaskInfo { name: t.name, ticks: t.ticks }).collect();
+        let tasks = s
+            .tasks
+            .iter()
+            .flatten()
+            .map(|t| TaskInfo { name: t.name, runtime: t.runtime })
+            .collect();
         (tasks, s.switches)
     })
+}
+
+/// Wake-to-run latency so far: (wakes, average µs, maximum µs).
+pub fn wake_latency() -> (u64, u64, u64) {
+    let w = with(|s| s.wakes);
+    let us = |counts: u64| counts * 1_000_000 / arch::timer_freq().max(1);
+    (w.count, us(w.total / w.count.max(1)), us(w.max))
 }
 
 /// How many tasks the reaper has freed so far.

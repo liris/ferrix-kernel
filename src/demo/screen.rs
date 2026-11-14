@@ -53,14 +53,14 @@ pub fn polling_loop(freq: u64) -> ! {
 /// Timer ticks per half clock period of the NAND counter (0.5 s).
 const HALF_PERIOD_TICKS: u64 = irq::TICK_HZ / 2;
 
-/// Task lines: CPU share per task (ticks it was running for), then progress.
+/// Task lines: CPU share per task since boot, then progress.
 fn task_status(line: usize) {
     let (tasks, switches) = task::snapshot();
-    let total = tasks.iter().map(|t| t.ticks).sum::<u64>().max(1);
+    let total = tasks.iter().map(|t| t.runtime).sum::<u64>().max(1);
     let mut cpu = String::from("cpu%");
     // Tasks under 1% are left out: with user programs not all names fit.
-    for t in tasks.iter().filter(|t| t.ticks * 100 / total > 0) {
-        cpu += &format!(" {} {}", t.name, t.ticks * 100 / total);
+    for t in tasks.iter().filter(|t| t.runtime * 100 / total > 0) {
+        cpu += &format!(" {} {}", t.name, t.runtime * 100 / total);
     }
     status_line(line, format_args!("{}", cpu));
     status_line(
@@ -89,6 +89,12 @@ fn reap_status(line: usize) {
             mmu::asids_in_use()
         ),
     );
+}
+
+/// How long a woken task waited for the CPU (`wake`, then run).
+fn wake_status(line: usize) {
+    let (n, avg, max) = task::wake_latency();
+    status_line(line, format_args!("wake n {}  avg {}us  max {}us", n, avg, max));
 }
 
 /// Ticks between redraws of the task lines (10 per second).
@@ -129,10 +135,11 @@ pub fn interrupt_loop(keyboard: bool, builder: bool) -> ! {
     let mut lab = Lab::new();
     println!("[lab ] counter {} NAND, adder {} NAND", lab.counter_gates(), lab.adder_gates());
     // Reserve a blank spacer, then rows for uptime, counter, adder, two task
-    // lines, the reaper's line, the user programs' lines and key help. Rows are taken relative
+    // lines, the reaper's and wake latency lines, the user programs' lines
+    // and key help. Rows are taken relative
     // to the cursor, which stays valid if the screen scrolls.
     let user_rows = user::lines().len();
-    let rows = 7 + user_rows;
+    let rows = 8 + user_rows;
     for _ in 0..rows {
         println!();
     }
@@ -172,7 +179,7 @@ pub fn interrupt_loop(keyboard: bool, builder: bool) -> ! {
         if user::generation() != generation {
             generation = user::generation();
             for (i, (name, text)) in user::lines().iter().enumerate() {
-                status_line(line + 6 + i, format_args!("{:<2} {}", name.unwrap_or(""), text));
+                status_line(line + 7 + i, format_args!("{:<2} {}", name.unwrap_or(""), text));
             }
         }
 
@@ -184,6 +191,7 @@ pub fn interrupt_loop(keyboard: bool, builder: bool) -> ! {
                 uptime(line, t / irq::TICK_HZ);
                 task_status(line + 3);
                 reap_status(line + 5);
+                wake_status(line + 6);
             }
             if lab.timer_clock((t / HALF_PERIOD_TICKS) % 2 == 1) {
                 status_line(line + 1, format_args!("{}", lab.counter_line()));

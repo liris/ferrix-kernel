@@ -6,7 +6,7 @@ A tiny AArch64 kernel written in Rust, booting from UEFI on VMware Fusion (Apple
 
 It starts as a UEFI application, collects the framebuffer, memory map and ACPI pointer, calls
 `ExitBootServices`, and then runs on its own code only: exception vectors, a page allocator and
-heap, its own page tables (W^X: only its code is executable, and read-only), GICv3 timer interrupts, preemptive round-robin tasks, a USB keyboard
+heap, its own page tables (W^X: only its code is executable, and read-only), GICv3 timer interrupts, preemptive tasks sharing the CPU by weight (woken tasks first), a USB keyboard
 through its own xHCI driver, and user programs at EL0 in their own address spaces that can only use
 the capabilities they were given, one of them a circuit builder you type NAND circuits into. A program that ends is reclaimed
 (its stack, pages and ASID), and one is restarted every few seconds to show that nothing leaks.
@@ -30,7 +30,7 @@ ferrix-kernel 0.1.0 (aarch64)
 [nand]  3 +  5 =  8  (0011 + 0101 = 01000)
 [ ok ] M2.5: 4-bit adder 512/512 (36 NAND)
 [ ok ] M3: virtual timer IRQ at 100 Hz
-[ ok ] M4: 6 tasks, round-robin, 10 ms slices
+[ ok ] M4: 6 tasks, weighted fair, 10 ms ticks
 [pci ] 01:00.0 xHCI 15ad:077a
 [usb ] port 6 full 0e0f:0006 keyboard
 [ ok ] M5: USB keyboard ready
@@ -43,9 +43,10 @@ ferrix-kernel 0.1.0 (aarch64)
 uptime 00:04:12
 ctr clk=0 q=1011 (11) edges=252 auto
 add a=0011 b=0101 c=0 -> 01000 (3+5+0=8)
-cpu% spin 25 nand 25 fpu 25 u2 24
+cpu% main 1 spin 6 nand 13 fpu 26 u2 52
 spin 26309M  nand 1627404  fpu 125926k  sw 43357
-reaped 99  u5 x49  free 123081  asid 5
+reaped 99  u5 x49  free 123080  asid 5
+wake n 2512  avg 2us  max 285us
 u1 count n=2101 &n=0x40000000b000 s2 refused
    u4 got it as slot 2
 u2 spin  n=19561M &n=0x40000000b000
