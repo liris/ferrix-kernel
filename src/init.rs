@@ -5,6 +5,7 @@ use crate::arch::{self, exception};
 use crate::dev::console::Framebuffer;
 use crate::dev::usb::{self, xhci};
 use crate::dev::{acpi, gic, pci};
+use crate::mm::image::{self, Access};
 use crate::mm::{self, mmu};
 use crate::proc::user;
 use crate::{ok, println};
@@ -76,11 +77,24 @@ pub fn memory(mmap: &impl MemoryMap) {
 }
 
 /// Builds the kernel's own page tables, identity mapping RAM, MMIO, the
-/// framebuffer and the GIC, and switches to them.
+/// framebuffer and the GIC, and switches to them. Only the kernel image's
+/// code is executable, and it is read-only (W^X); the tables are walked
+/// afterwards to check that.
 pub fn page_tables(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::GicInfo>) {
     let mut m = mmu::Mapper::new();
 
     // Most specific first: the first mapping of an address wins.
+    let sections = image::sections().unwrap_or_else(|e| panic!("kernel image: {}", e));
+    let mut bytes = [0u64; 3];
+    for s in &sections {
+        let (kind, i) = match s.access {
+            Access::Code => (mmu::Kind::Code, 0),
+            Access::ReadOnly => (mmu::Kind::Rodata, 1),
+            Access::Data => (mmu::Kind::Data, 2),
+        };
+        m.map(s.start, s.len, kind);
+        bytes[i] += s.len;
+    }
     if let Some(g) = gic {
         if let Some(d) = g.gicd {
             m.map(d, gic::GICD_SIZE, mmu::Kind::Device);
@@ -94,9 +108,11 @@ pub fn page_tables(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::G
     for d in mmap.entries() {
         let kind = match d.ty {
             MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE => mmu::Kind::Device,
-            // LOADER_CODE holds our whole PE image, data sections included.
-            MemoryType::LOADER_CODE | MemoryType::RUNTIME_SERVICES_CODE => mmu::Kind::Code,
-            MemoryType::CONVENTIONAL
+            // LOADER_CODE is our image, mapped section by section above; we never call
+            // runtime services, so their code needn't be executable either.
+            MemoryType::LOADER_CODE
+            | MemoryType::RUNTIME_SERVICES_CODE
+            | MemoryType::CONVENTIONAL
             | MemoryType::LOADER_DATA
             | MemoryType::BOOT_SERVICES_CODE
             | MemoryType::BOOT_SERVICES_DATA
@@ -117,13 +133,18 @@ pub fn page_tables(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::G
     unsafe { m.activate() };
     println!("[mmu ] TTBR0 {:#x} -> {:#x} (ours)", old, mmu::ttbr0());
     println!(
-        "[mmu ] code {} data {} dev {} fb {} MiB",
-        st.bytes[1] >> 20,
-        st.bytes[0] >> 20,
-        st.bytes[2] >> 20,
-        st.bytes[3] >> 20
+        "[mmu ] data {} dev {} fb {} MiB",
+        st.bytes[mmu::Kind::Data as usize] >> 20,
+        st.bytes[mmu::Kind::Device as usize] >> 20,
+        st.bytes[mmu::Kind::Uncached as usize] >> 20
     );
     println!("[mmu ] {} tables, {} blocks, {} pages", st.tables, st.blocks, st.pages);
+    println!(
+        "[mmu ] image: text {}K ro {}K data {}K",
+        bytes[0] >> 10,
+        bytes[1] >> 10,
+        bytes[2] >> 10
+    );
 
     // Check through the MMU itself, without risking a fault.
     let code = crate::banner as fn() as usize as u64;
@@ -134,6 +155,13 @@ pub fn page_tables(fb: &Framebuffer, mmap: &impl MemoryMap, gic: Option<&acpi::G
         panic!("kernel code {:#x} is not identity mapped", code);
     }
     ok("M3b: own page tables, null page unmapped");
+
+    let a = mmu::audit();
+    println!("[mmu ] exec {} pages, W+X {}, EL0 {}", a.exec, a.write_exec, a.user);
+    if a.write_exec != 0 || a.user != 0 || !mmu::wxn() {
+        panic!("W^X does not hold (WXN {})", mmu::wxn());
+    }
+    ok("M10c: kernel W^X, WXN on");
 }
 
 /// Finds the GIC in the MADT and reports it.

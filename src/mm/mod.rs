@@ -10,6 +10,7 @@
 //!
 //! Single core: both are shared with preemptible tasks by masking IRQs.
 
+pub mod image;
 pub mod mmu;
 
 use crate::global::Global;

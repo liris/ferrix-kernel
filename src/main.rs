@@ -129,6 +129,13 @@ fn kernel_main(info: &BootInfo, mmap: &impl MemoryMap) -> ! {
         // It's an `asm!` load rather than a Rust one so no Rust-level UB is involved.
         unsafe { asm!("ldr {0}, [{0}]", inout(reg) 0u64 => _, options(nostack, readonly)) };
     }
+    if cfg!(feature = "fault-text") {
+        let target = banner as fn() as usize as u64;
+        println!("[test] writing to kernel code at {:#x}...", target);
+        // SAFETY: `.text` is mapped read-only, so the store raises a permission fault,
+        // which panics before anything is written. An `asm!` store, so no Rust-level UB.
+        unsafe { asm!("str xzr, [{}]", in(reg) target, options(nostack)) };
+    }
 
     // SAFETY: `gic` came from `acpi::find_gic`, and `init_mmu` mapped its ranges.
     match gic.as_ref().map(|g| unsafe { gic::init(g) }) {

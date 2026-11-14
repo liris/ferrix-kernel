@@ -10,8 +10,10 @@ nand = { path = "nand" }
 uefi = { version = "0.41.0" }
 
 [features]
-# Deliberately fault after boot to show the panic screen.
+# Deliberately fault after boot to show the panic screen: a null pointer
+# read, or (W^X) a write to the kernel's own code.
 fault-test = []
+fault-text = []
 
 [profile.dev]
 panic = "abort"

@@ -2,9 +2,13 @@
 //!
 //! Still an identity map (VA = PA), but now only what the kernel needs is
 //! mapped, with attributes chosen per region: RAM is cacheable and
-//! non-executable except for code regions, the GIC and MMIO are device
-//! memory, the framebuffer is non-cacheable. Page 0 is never mapped, so a
-//! null dereference faults.
+//! non-executable, the GIC and MMIO are device memory, the framebuffer is
+//! non-cacheable. Page 0 is never mapped, so a null dereference faults.
+//!
+//! W^X (M10c): the only executable kernel memory is the image's code
+//! sections, mapped read-only; everything writable is non-executable.
+//! `SCTLR_EL1.WXN` backs that up in hardware, and `audit` walks the tables
+//! to check it.
 //!
 //! 4 KiB granule, 48-bit VA (T0SZ = 16), walks start at level 0. Ranges are
 //! mapped with the largest block that fits (1 GiB, 2 MiB) and 4 KiB pages
@@ -59,7 +63,7 @@ const ATTR_NC: u64 = 2 << 2;
 pub enum Kind {
     /// Cacheable RAM, read/write, never executable.
     Data,
-    /// Cacheable RAM, read/write/execute.
+    /// Kernel code: cacheable, read-only, executable at EL1 only.
     Code,
     /// Device-nGnRE MMIO, never executable.
     Device,
@@ -71,9 +75,11 @@ pub enum Kind {
     UserRo,
     /// User data and stack: EL0 may read and write, nobody may execute.
     UserData,
+    /// Kernel constants: cacheable, read-only, never executable.
+    Rodata,
 }
 
-const KINDS: usize = 7;
+const KINDS: usize = 8;
 const USER: u64 = ATTR_NORMAL | DESC_SH_INNER | DESC_AF | DESC_AP_EL0 | DESC_NG | DESC_PXN;
 
 impl Kind {
@@ -84,7 +90,10 @@ impl Kind {
     fn attrs(self) -> u64 {
         match self {
             Kind::Data => ATTR_NORMAL | DESC_SH_INNER | DESC_AF | DESC_PXN | DESC_UXN,
-            Kind::Code => ATTR_NORMAL | DESC_SH_INNER | DESC_AF | DESC_UXN,
+            Kind::Code => ATTR_NORMAL | DESC_SH_INNER | DESC_AF | DESC_AP_RO | DESC_UXN,
+            Kind::Rodata => {
+                ATTR_NORMAL | DESC_SH_INNER | DESC_AF | DESC_AP_RO | DESC_PXN | DESC_UXN
+            }
             Kind::Device => ATTR_DEVICE | DESC_AF | DESC_PXN | DESC_UXN,
             Kind::Uncached => ATTR_NC | DESC_SH_INNER | DESC_AF | DESC_PXN | DESC_UXN,
             Kind::UserCode => USER | DESC_AP_RO,
@@ -238,6 +247,15 @@ impl Mapper {
                 "tlbi vmalle1",        // drop the firmware's translations
                 "dsb ish",
                 "isb",
+                "mrs {sctlr}, sctlr_el1",
+                "orr {sctlr}, {sctlr}, {wxn}", // writable implies never executable
+                "msr sctlr_el1, {sctlr}",
+                "isb",
+                "tlbi vmalle1",        // WXN may be cached in the TLB
+                "dsb ish",
+                "isb",
+                sctlr = out(reg) _,
+                wxn = in(reg) SCTLR_WXN,
                 mair = in(reg) MAIR,
                 tcr = in(reg) tcr,
                 ttbr = in(reg) self.root as u64,
@@ -248,7 +266,70 @@ impl Mapper {
     }
 }
 
+/// SCTLR_EL1.WXN: any writable mapping is treated as execute-never.
+const SCTLR_WXN: u64 = 1 << 19;
+
 static ACTIVE: Global<Mapper> = Global::new("page tables");
+
+/// What `audit` found in the kernel's tables, in 4 KiB pages.
+#[derive(Default, Clone, Copy)]
+pub struct Audit {
+    /// Executable at EL1.
+    pub exec: usize,
+    /// Writable at EL1 and executable at EL1: must be 0.
+    pub write_exec: usize,
+    /// Reachable from EL0: must be 0 in the kernel's own tables.
+    pub user: usize,
+}
+
+/// Counts the leaf entries below the level `level` table at `table`.
+///
+/// # Safety
+///
+/// `table` must be a table from `new_table`, as every table below the active root is.
+unsafe fn audit_level(table: *const u64, level: usize, audit: &mut Audit) {
+    for i in 0..ENTRIES {
+        // SAFETY: a whole table page (caller).
+        let entry = unsafe { *table.add(i) };
+        if entry & DESC_VALID == 0 {
+            continue;
+        }
+        if level < 3 && entry & DESC_TABLE_OR_PAGE != 0 {
+            // SAFETY: a table below ours, made by `map_level`.
+            unsafe { audit_level((entry & DESC_ADDR) as *const u64, level + 1, audit) };
+            continue;
+        }
+        let pages = 1 << (9 * (3 - level));
+        let exec = entry & DESC_PXN == 0;
+        if exec {
+            audit.exec += pages;
+        }
+        if exec && entry & DESC_AP_RO == 0 {
+            audit.write_exec += pages;
+        }
+        if entry & DESC_AP_EL0 != 0 {
+            audit.user += pages;
+        }
+    }
+}
+
+/// Walks the kernel's own tables and counts what `Audit` lists.
+pub fn audit() -> Audit {
+    ACTIVE.with(|m| {
+        let mut audit = Audit::default();
+        // SAFETY: `root` and everything below it were made by `new_table`.
+        unsafe { audit_level(m.root, 0, &mut audit) };
+        audit
+    })
+}
+
+/// Whether `SCTLR_EL1.WXN` is set.
+pub fn wxn() -> bool {
+    let v: u64;
+    // SAFETY: reading a system register has no side effects.
+    unsafe { asm!("mrs {}, sctlr_el1", out(reg) v, options(nomem, nostack)) };
+    v & SCTLR_WXN != 0
+}
 
 /// Maps another region into the active tables. Like `Mapper::map`, parts
 /// that are already mapped keep their mapping.

@@ -6,7 +6,7 @@ A tiny AArch64 kernel written in Rust, booting from UEFI on VMware Fusion (Apple
 
 It starts as a UEFI application, collects the framebuffer, memory map and ACPI pointer, calls
 `ExitBootServices`, and then runs on its own code only: exception vectors, a page allocator and
-heap, its own page tables, GICv3 timer interrupts, preemptive round-robin tasks, a USB keyboard
+heap, its own page tables (W^X: only its code is executable, and read-only), GICv3 timer interrupts, preemptive round-robin tasks, a USB keyboard
 through its own xHCI driver, and user programs at EL0 in their own address spaces that can only use
 the capabilities they were given, one of them a circuit builder you type NAND circuits into. A program that ends is reclaimed
 (its stack, pages and ASID), and one is restarted every few seconds to show that nothing leaks.
@@ -26,6 +26,7 @@ ferrix-kernel 0.1.0 (aarch64)
 [ ok ] M2: exceptions and memory
 [mmu ] TTBR0 0x9ffdf000 -> 0x80380000 (ours)
 [ ok ] M3b: own page tables, null page unmapped
+[ ok ] M10c: kernel W^X, WXN on
 [nand]  3 +  5 =  8  (0011 + 0101 = 01000)
 [ ok ] M2.5: 4-bit adder 512/512 (36 NAND)
 [ ok ] M3: virtual timer IRQ at 100 Hz
@@ -73,6 +74,7 @@ keys -> u6 circuit builder  tab:lab
 | `make vm` | Assemble a VMware Fusion VM in `build/ferrix-kernel.vmwarevm` |
 | `make vm-run` | Assemble that VM and cold-boot it with the fresh ISO |
 | `make run FEATURES=fault-test` | Boot with a deliberate null dereference to show the panic screen |
+| `make run FEATURES=fault-text` | Boot with a deliberate write to the kernel's own code, which W^X turns into the panic screen |
 
 ## Keys
 

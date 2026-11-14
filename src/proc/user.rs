@@ -481,31 +481,8 @@ pub fn syscall(f: &mut TrapFrame) -> *mut TrapFrame {
     f
 }
 
-/// Fault status code (ISS bits 5:0) of an abort, in words.
-fn fault_status(iss: u64) -> &'static str {
-    match iss & 0x3f {
-        0x04..=0x07 => "unmapped",
-        0x09..=0x0b => "access flag",
-        0x0d..=0x0f => "no permission",
-        _ => "fault",
-    }
-}
-
-const EC_INSTRUCTION_ABORT_EL0: u64 = 0x20;
-const EC_DATA_ABORT_EL0: u64 = 0x24;
-/// Data abort ISS: the access was a write.
-const ISS_WNR: u64 = 1 << 6;
-
 /// Any other synchronous exception from EL0: the program is killed.
 pub fn fault(f: &mut TrapFrame, ec: u64) -> *mut TrapFrame {
-    let iss = f.esr & 0x1ff_ffff;
-    let what = match ec {
-        EC_DATA_ABORT_EL0 => {
-            let access = if iss & ISS_WNR != 0 { "write" } else { "read" };
-            format!("{} {:#x} {}", access, f.far, fault_status(iss))
-        }
-        EC_INSTRUCTION_ABORT_EL0 => format!("exec {:#x} {}", f.far, fault_status(iss)),
-        _ => exception::ec_name(ec).to_owned(),
-    };
+    let what = exception::abort_detail(f).unwrap_or_else(|| exception::ec_name(ec).to_owned());
     end(f, format!("killed: {}", what))
 }

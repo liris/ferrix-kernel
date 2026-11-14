@@ -4,7 +4,7 @@
 
 Rust で書いた小さな AArch64 カーネルです。UEFI から起動し、VMware Fusion（Apple Silicon）と QEMU で動きます。
 
-UEFI アプリとして起動してフレームバッファ・メモリマップ・ACPI のポインタを集め、`ExitBootServices` を呼んだあとは自前のコードだけで動きます。例外ベクタ、ページアロケータとヒープ、自前のページテーブル、GICv3 のタイマー割り込み、プリエンプティブなラウンドロビンのタスク、自前の xHCI ドライバによる USB キーボード入力、専用のアドレス空間で EL0 で動き、渡された capability しか使えないユーザープログラムを備えています。その一つは、NAND 回路を打ち込んで組み立てられる回路ビルダーです。終了したプログラムはスタック・ページ・ASID まで回収し、その一つを数秒ごとに起動し直して、何も漏れていないことを示します。capability はチャネルで渡せます。渡すと移動するので、渡した側の手元には残りません。あわせて、NAND だけを部品とする回路シミュレータで加算器とカウンタを組み、キーボードから操作できます。
+UEFI アプリとして起動してフレームバッファ・メモリマップ・ACPI のポインタを集め、`ExitBootServices` を呼んだあとは自前のコードだけで動きます。例外ベクタ、ページアロケータとヒープ、自前のページテーブル（W^X: 実行できるのは読み取り専用のコードだけ）、GICv3 のタイマー割り込み、プリエンプティブなラウンドロビンのタスク、自前の xHCI ドライバによる USB キーボード入力、専用のアドレス空間で EL0 で動き、渡された capability しか使えないユーザープログラムを備えています。その一つは、NAND 回路を打ち込んで組み立てられる回路ビルダーです。終了したプログラムはスタック・ページ・ASID まで回収し、その一つを数秒ごとに起動し直して、何も漏れていないことを示します。capability はチャネルで渡せます。渡すと移動するので、渡した側の手元には残りません。あわせて、NAND だけを部品とする回路シミュレータで加算器とカウンタを組み、キーボードから操作できます。
 
 VMware Fusion での起動画面（抜粋）:
 
@@ -18,6 +18,7 @@ ferrix-kernel 0.1.0 (aarch64)
 [ ok ] M2: exceptions and memory
 [mmu ] TTBR0 0x9ffdf000 -> 0x80380000 (ours)
 [ ok ] M3b: own page tables, null page unmapped
+[ ok ] M10c: kernel W^X, WXN on
 [nand]  3 +  5 =  8  (0011 + 0101 = 01000)
 [ ok ] M2.5: 4-bit adder 512/512 (36 NAND)
 [ ok ] M3: virtual timer IRQ at 100 Hz
@@ -65,6 +66,7 @@ keys -> u6 circuit builder  tab:lab
 | `make vm` | VMware Fusion の VM を `build/ferrix-kernel.vmwarevm` に組み立てる |
 | `make vm-run` | その VM を組み立て、新しい ISO でコールドブートする |
 | `make run FEATURES=fault-test` | わざとヌルポインタを参照してパニック画面を出す |
+| `make run FEATURES=fault-text` | わざとカーネル自身のコードに書き込み、W^X によってパニック画面を出す |
 
 ## キー操作
 

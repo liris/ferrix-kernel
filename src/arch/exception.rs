@@ -15,6 +15,8 @@
 //! any other synchronous exception from EL0 is the program's fault and ends
 //! that task only.
 
+use alloc::format;
+use alloc::string::String;
 use core::arch::{asm, global_asm};
 
 #[repr(C)]
@@ -211,6 +213,37 @@ pub fn ec_name(ec: u64) -> &'static str {
     }
 }
 
+/// Fault status code (ISS bits 5:0) of an abort, in words.
+fn fault_status(iss: u64) -> &'static str {
+    match iss & 0x3f {
+        0x04..=0x07 => "unmapped",
+        0x09..=0x0b => "access flag",
+        0x0d..=0x0f => "no permission",
+        _ => "fault",
+    }
+}
+
+/// Instruction and data aborts, from EL0 (even) or EL1 (odd).
+const EC_INSTRUCTION_ABORT: core::ops::RangeInclusive<u64> = 0x20..=0x21;
+const EC_DATA_ABORT: core::ops::RangeInclusive<u64> = 0x24..=0x25;
+/// Data abort ISS: the access was a write.
+const ISS_WNR: u64 = 1 << 6;
+
+/// What an instruction or data abort tried, e.g. `write 0x1234 no
+/// permission`; `None` for other exceptions.
+pub fn abort_detail(f: &TrapFrame) -> Option<String> {
+    let ec = (f.esr >> 26) & 0x3f;
+    let iss = f.esr & 0x1ff_ffff;
+    let access = if EC_DATA_ABORT.contains(&ec) {
+        if iss & ISS_WNR != 0 { "write" } else { "read" }
+    } else if EC_INSTRUCTION_ABORT.contains(&ec) {
+        "exec"
+    } else {
+        return None;
+    };
+    Some(format!("{} {:#x} {}", access, f.far, fault_status(iss)))
+}
+
 extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) -> *mut TrapFrame {
     let ec = (frame.esr >> 26) & 0x3f;
     let iss = frame.esr & 0x1ff_ffff;
@@ -246,12 +279,14 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, kind: u64) -> *mut TrapFra
         return frame;
     }
 
+    let detail = abort_detail(frame).map(|d| format!("\n  {}", d)).unwrap_or_default();
     panic!(
-        "unhandled {} exception from {}\n  {} (EC={:#04x})\n  ESR={:#010x} FAR={:#x}\n  ELR={:#x} SPSR={:#x}",
+        "unhandled {} exception from {}\n  {} (EC={:#04x}){}\n  ESR={:#010x} FAR={:#x}\n  ELR={:#x} SPSR={:#x}",
         KIND_NAMES[(kind % 4) as usize],
         ORIGIN_NAMES[(kind / 4) as usize],
         ec_name(ec),
         ec,
+        detail,
         frame.esr,
         frame.far,
         frame.elr,
