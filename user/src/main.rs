@@ -4,13 +4,18 @@
 //! address space, and passes a role in x0 (and an argument in x1):
 //!
 //! - `count`: counts once per 100 ms, shows the counter and its address,
-//!   and sends each value on the channel in capability slot 1.
+//!   and sends each value on the channel in capability slot 1. It also
+//!   holds the line below its own (slot 2), and after 3 s moves that
+//!   capability to `forge` over the channel in slot 3; from then on its own
+//!   writes through slot 2 are refused.
 //! - `spin`: counts as fast as it can and never yields, so it only stops
 //!   because the timer preempts it, even at EL0. Its counter has the same
 //!   address as `count`'s, in a different address space.
 //! - `sink`: receives `count`'s values from the channel in slot 1.
-//! - `forge`: holds only its own line, and keeps trying to write with other
-//!   slot numbers. Every attempt must be refused.
+//! - `forge`: holds only its own line and the receiving end of `count`'s
+//!   second channel (slot 1), and keeps trying to write with other slot
+//!   numbers. Every attempt must be refused, except through the line
+//!   capability it receives from `count`, which it then writes with.
 //! - `bad`: tries to read kernel memory at the address in x1, which must
 //!   kill it and nothing else.
 //! - `builder`: the circuit builder (`builder`), fed by the keyboard
@@ -39,9 +44,13 @@ const SYS_SLEEP: u64 = 2;
 const SYS_SEND: u64 = 3;
 const SYS_RECV: u64 = 4;
 const SYS_WAIT: u64 = 5;
+const SYS_SEND_CAP: u64 = 6;
 
 const OK: u64 = 0;
 const ERR_CAP: u64 = 1;
+
+/// x2 after `recv` / `wait`: a capability arrived, and x1 is its slot.
+const KIND_CAP: u64 = 1;
 
 const ROLE_COUNT: u64 = 0;
 const ROLE_SPIN: u64 = 1;
@@ -53,22 +62,43 @@ const ROLE_BUILDER: u64 = 5;
 /// Capability slots handed out by the kernel.
 const SCREEN: u64 = 0;
 const CHANNEL: u64 = 1;
+/// `count`'s: the line it hands over, and the channel to `forge`.
+const GIFT_LINE: u64 = 2;
+const GIFT_CHANNEL: u64 = 3;
+/// `forge`'s receiving end of that channel.
+const GIFT_INBOX: u64 = 1;
 
-/// Returns (x0, x1) after the call.
-fn syscall(number: u64, a: u64, b: u64, c: u64) -> (u64, u64) {
-    let (r0, r1);
+/// Returns (x0, x1, x2) after the call.
+fn syscall(number: u64, a: u64, b: u64, c: u64) -> (u64, u64, u64) {
+    let (r0, r1, r2);
     // SAFETY: the kernel reads only the argument registers and restores the rest.
     unsafe {
         asm!(
             "svc #0",
             inlateout("x0") a => r0,
             inlateout("x1") b => r1,
-            in("x2") c,
+            inlateout("x2") c => r2,
             in("x8") number,
             options(nostack),
         )
     };
-    (r0, r1)
+    (r0, r1, r2)
+}
+
+/// A received message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Msg {
+    Value(u64),
+    /// A capability, now in this slot of our table.
+    Cap(u64),
+}
+
+fn msg((status, x1, kind): (u64, u64, u64)) -> Option<Msg> {
+    match (status, kind) {
+        (OK, KIND_CAP) => Some(Msg::Cap(x1)),
+        (OK, _) => Some(Msg::Value(x1)),
+        _ => None,
+    }
 }
 
 fn exit(code: u64) -> ! {
@@ -85,20 +115,20 @@ fn send(cap: u64, value: u64) -> u64 {
     syscall(SYS_SEND, cap, value, 0).0
 }
 
-fn recv(cap: u64) -> Option<u64> {
-    match syscall(SYS_RECV, cap, 0, 0) {
-        (OK, value) => Some(value),
-        _ => None,
-    }
+/// Moves the capability in slot `slot` onto the channel in slot `cap`;
+/// returns the status. Once sent, `slot` is empty.
+fn send_cap(cap: u64, slot: u64) -> u64 {
+    syscall(SYS_SEND_CAP, cap, slot, 0).0
+}
+
+fn recv(cap: u64) -> Option<Msg> {
+    msg(syscall(SYS_RECV, cap, 0, 0))
 }
 
 /// Blocks until the channel in slot `cap` has a message. `None` if `cap`
 /// is not a receiving end.
-fn wait(cap: u64) -> Option<u64> {
-    match syscall(SYS_WAIT, cap, 0, 0) {
-        (OK, value) => Some(value),
-        _ => None,
-    }
+fn wait(cap: u64) -> Option<Msg> {
+    msg(syscall(SYS_WAIT, cap, 0, 0))
 }
 
 /// One screen line of text, formatted on the stack; longer text is cut.
@@ -183,10 +213,26 @@ fn show(args: fmt::Arguments) {
 /// The same virtual address in every copy, but each copy's own memory.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// `count` hands its second line to `forge` at this count (3 s).
+const GIFT_AT: u64 = 30;
+
 fn count() -> ! {
+    write(GIFT_LINE, format_args!("u1 owns this line"));
+    let mut given = false;
     loop {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        show(format_args!("count n={} &n={:#x}", n, &COUNTER as *const _ as usize));
+        if !given && n >= GIFT_AT {
+            given = send_cap(GIFT_CHANNEL, GIFT_LINE) == OK;
+        }
+        let addr = &COUNTER as *const _ as usize;
+        if given {
+            // The slot is empty now: this must be refused.
+            let refused = write(GIFT_LINE, format_args!("u1 still writing")) == ERR_CAP;
+            let what = if refused { "refused" } else { "ALLOWED" };
+            show(format_args!("count n={} &n={:#x} s2 {}", n, addr, what));
+        } else {
+            show(format_args!("count n={} &n={:#x}", n, addr));
+        }
         // If the sink falls behind, the value is simply dropped.
         send(CHANNEL, n);
         sleep(10);
@@ -207,11 +253,11 @@ fn spin() -> ! {
 fn sink() -> ! {
     let mut got = 0u64;
     loop {
-        let Some(mut last) = wait(CHANNEL) else {
+        let Some(Msg::Value(mut last)) = wait(CHANNEL) else {
             exit(4);
         };
         got += 1;
-        while let Some(n) = recv(CHANNEL) {
+        while let Some(Msg::Value(n)) = recv(CHANNEL) {
             got += 1;
             last = n;
         }
@@ -223,8 +269,14 @@ fn sink() -> ! {
 fn forge() -> ! {
     let mut denied = 0u64;
     let mut tried = 0u64;
+    // The slot `count`'s line arrives in, once it has.
+    let mut gift = None;
     loop {
-        for slot in 1..=8 {
+        if let Some(Msg::Cap(slot)) = recv(GIFT_INBOX) {
+            gift = Some(slot);
+            write(slot, format_args!("u4 got it as slot {}", slot));
+        }
+        for slot in (1..=8).filter(|&s| Some(s) != gift) {
             tried += 1;
             if write(slot, format_args!("forged by u4")) == ERR_CAP {
                 denied += 1;

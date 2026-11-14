@@ -14,11 +14,18 @@
 //! | 1 | write | x0 = `Screen` cap, x1 = pointer, x2 = length, x3 = row in its range: replaces that line | x0 = status |
 //! | 2 | sleep | x0 = timer ticks | x0 = 0 |
 //! | 3 | send | x0 = `Send` cap, x1 = value | x0 = status |
-//! | 4 | recv | x0 = `Recv` cap | x0 = status, x1 = value |
-//! | 5 | wait | x0 = `Recv` cap: like recv, but blocks while the channel is empty | x0 = status, x1 = value |
+//! | 4 | recv | x0 = `Recv` cap | x0 = status, x1 = value or new slot, x2 = 0 value / 1 capability |
+//! | 5 | wait | x0 = `Recv` cap: like recv, but blocks while the channel is empty | as recv |
+//! | 6 | send_cap | x0 = `Send` cap, x1 = slot of the capability to move | x0 = status |
 //!
 //! Status: 0 done, 1 no such capability (or the wrong kind, or a row outside
-//! the range), 2 bad pointer, 3 channel empty, 4 channel full.
+//! the range), 2 bad pointer, 3 channel empty, 4 full (the channel; for a
+//! received capability, the receiver's table).
+//!
+//! `send_cap` moves a capability: the sender's slot is empty once it is
+//! queued, and a receiver gets it in its first free slot. If the channel is
+//! full the sender keeps it; if the receiver's table is full the message
+//! stays queued. Either way a capability is never lost or copied.
 //!
 //! A `wait` on an empty channel blocks the task with ELR moved back onto
 //! the `svc`, so once a `send` wakes it the call simply runs again. Typed
@@ -38,7 +45,7 @@
 use crate::arch::exception::{self, TrapFrame};
 use crate::global::Global;
 use crate::mm::mmu::{self, AddressSpace, Kind};
-use crate::proc::cap::{Cap, CapTable, Channels};
+use crate::proc::cap::{Cap, CapTable, Channels, Msg};
 use crate::proc::task;
 use crate::{arch, mm};
 use alloc::borrow::ToOwned;
@@ -54,6 +61,11 @@ const SYS_SLEEP: u64 = 2;
 const SYS_SEND: u64 = 3;
 const SYS_RECV: u64 = 4;
 const SYS_WAIT: u64 = 5;
+const SYS_SEND_CAP: u64 = 6;
+
+/// x2 after `recv` / `wait`: what x1 holds.
+const KIND_VALUE: u64 = 0;
+const KIND_CAP: u64 = 1;
 
 const OK: u64 = 0;
 const ERR_CAP: u64 = 1;
@@ -206,6 +218,16 @@ fn load(elf: &[u8]) -> Result<(AddressSpace, u64), &'static str> {
     Ok((space, entry))
 }
 
+/// Adds `rows` screen lines, labelled `label` on the first; returns the
+/// index of the first.
+fn reserve(s: &mut State, label: Option<&'static str>, rows: usize) -> usize {
+    let first = s.lines.len();
+    s.lines.resize(first + rows, String::new());
+    s.labels.resize(first + rows, None);
+    s.labels[first] = label;
+    first
+}
+
 /// Loads a program and starts it as `name`, writing to the screen lines
 /// `first..first + rows` and holding only `extra` besides them.
 fn launch(
@@ -264,40 +286,40 @@ pub fn respawns() -> Respawns {
 }
 
 /// Starts the demo programs, each with its own lines on screen and only the
-/// capabilities listed for it, and the task that restarts `u5`. Returns
-/// (programs, capabilities handed out).
-pub fn start() -> Result<(usize, usize), &'static str> {
+/// capabilities listed for it, and the task that restarts `u5`. `u1` also
+/// gets the line below its own and a channel to `u4`, to hand that line
+/// over. Returns (programs, capabilities handed out, channels).
+pub fn start() -> Result<(usize, usize, usize), &'static str> {
     arch::allow_fp_at_el0();
     let secret = secret_addr();
-    let (chan, keys) = with(|s| {
+    let (chan, keys, gift) = with(|s| {
         let keys = s.channels.create(KEY_DEPTH);
         s.keys = Some(keys);
-        (s.channels.create(CHANNEL_DEPTH), keys)
+        (s.channels.create(CHANNEL_DEPTH), keys, s.channels.create(1))
     });
+    let (u1, gift_line) = with(|s| (reserve(s, Some("u1"), 1), reserve(s, None, 1)));
+    let gift_screen = Cap::Screen { first: gift_line, rows: 1 };
+    launch("u1", ROLE_COUNT, 0, u1, 1, &[Cap::Send(chan), gift_screen, Cap::Send(gift)])?;
     // (name, role, argument, rows on screen, capabilities after its screen)
-    let programs: [(&str, u64, u64, usize, &[Cap]); 6] = [
-        ("u1", ROLE_COUNT, 0, 1, &[Cap::Send(chan)]),
+    let programs: [(&str, u64, u64, usize, &[Cap]); 5] = [
         ("u2", ROLE_SPIN, 0, 1, &[]),
         ("u3", ROLE_SINK, 0, 1, &[Cap::Recv(chan)]),
-        ("u4", ROLE_FORGE, 0, 1, &[]),
+        ("u4", ROLE_FORGE, 0, 1, &[Cap::Recv(gift)]),
         ("u5", ROLE_BAD, secret, 1, &[]),
         ("u6", ROLE_BUILDER, 0, BUILDER_ROWS, &[Cap::Recv(keys)]),
     ];
     for (name, role, arg, rows, extra) in programs {
-        let first = with(|s| {
-            let first = s.lines.len();
-            s.lines.resize(first + rows, String::new());
-            s.labels.resize(first + rows, None);
-            s.labels[first] = Some(name);
-            if role == ROLE_BAD {
-                s.bad_line = first;
-            }
-            first
-        });
+        let first = with(|s| reserve(s, Some(name), rows));
+        if role == ROLE_BAD {
+            with(|s| s.bad_line = first);
+        }
         launch(name, role, arg, first, rows, extra)?;
     }
     task::spawn("respawn", respawn_task);
-    Ok(with(|s| (s.programs.len(), s.programs.iter().map(|p| p.caps.len()).sum())))
+    Ok(with(|s| {
+        let caps = s.programs.iter().map(|p| p.caps.len()).sum();
+        (s.programs.len(), caps, s.channels.count())
+    }))
 }
 
 pub fn elf_size() -> usize {
@@ -321,7 +343,7 @@ pub fn send_key(key: char) -> bool {
     let Some(keys) = with(|s| s.keys) else {
         return false;
     };
-    let sent = with(|s| s.channels.send(keys, key as u64));
+    let sent = with(|s| s.channels.send(keys, Msg::Value(key as u64)));
     task::wake(keys as u64);
     sent
 }
@@ -372,6 +394,45 @@ fn read_user(ptr: u64, len: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `send` (`value` is the message) or `send_cap` (`value` is the slot of the
+/// capability to move) on the `Send` capability in slot `cap`. Returns the
+/// channel, to wake its receiver, or a status.
+fn send(s: &mut State, cap: u64, value: u64, is_cap: bool) -> Result<usize, u64> {
+    let (Some(me), Some(Cap::Send(chan))) = lookup(s, cap) else {
+        return Err(ERR_CAP);
+    };
+    let msg = if is_cap {
+        Msg::Cap(s.programs[me].caps.get(value).ok_or(ERR_CAP)?)
+    } else {
+        Msg::Value(value)
+    };
+    if !s.channels.send(chan, msg) {
+        // A capability stays with the sender.
+        return Err(ERR_FULL);
+    }
+    if is_cap {
+        s.programs[me].caps.take(value);
+    }
+    Ok(chan)
+}
+
+/// `recv` on the `Recv` capability in slot `cap`: (x1, kind) of the oldest
+/// message, `None` if there is none, or a status. A capability goes into
+/// the caller's first free slot, and x1 is that slot.
+fn recv(s: &mut State, cap: u64) -> Result<Option<(u64, u64)>, u64> {
+    let (Some(me), Some(Cap::Recv(chan))) = lookup(s, cap) else {
+        return Err(ERR_CAP);
+    };
+    let got = match s.channels.peek(chan) {
+        None => return Ok(None),
+        Some(Msg::Value(v)) => (v, KIND_VALUE),
+        // Left queued if there is no room for it.
+        Some(Msg::Cap(c)) => (s.programs[me].caps.insert(c).ok_or(ERR_FULL)? as u64, KIND_CAP),
+    };
+    s.channels.recv(chan);
+    Ok(Some(got))
+}
+
 /// `svc #0` from EL0. Returns the frame to resume.
 pub fn syscall(f: &mut TrapFrame) -> *mut TrapFrame {
     let (a, b, c, d) = (f.x[0], f.x[1], f.x[2], f.x[3]);
@@ -393,32 +454,28 @@ pub fn syscall(f: &mut TrapFrame) -> *mut TrapFrame {
                 _ => ERR_CAP,
             };
         }
-        SYS_SEND => {
-            f.x[0] = match with(|s| lookup(s, a).1) {
-                Some(Cap::Send(chan)) => {
-                    let sent = with(|s| s.channels.send(chan, b));
+        SYS_SEND | SYS_SEND_CAP => {
+            f.x[0] = match with(|s| send(s, a, b, f.x[8] == SYS_SEND_CAP)) {
+                Ok(chan) => {
                     task::wake(chan as u64);
-                    if sent { OK } else { ERR_FULL }
+                    OK
                 }
-                _ => ERR_CAP,
+                Err(status) => status,
             };
         }
-        SYS_RECV | SYS_WAIT => {
-            let got = with(|s| match lookup(s, a).1 {
-                Some(Cap::Recv(chan)) => Ok((chan, s.channels.recv(chan))),
-                _ => Err(()),
-            });
-            match got {
-                Ok((_, Some(value))) => (f.x[0], f.x[1]) = (OK, value),
-                Ok((chan, None)) if f.x[8] == SYS_WAIT => {
-                    // Back onto the `svc`: it runs again once woken.
-                    f.elr -= 4;
-                    return task::block_from_trap(f, chan as u64);
-                }
-                Ok((_, None)) => (f.x[0], f.x[1]) = (ERR_EMPTY, 0),
-                Err(()) => (f.x[0], f.x[1]) = (ERR_CAP, 0),
+        SYS_RECV | SYS_WAIT => match with(|s| recv(s, a)) {
+            Ok(Some((x1, kind))) => (f.x[0], f.x[1], f.x[2]) = (OK, x1, kind),
+            Ok(None) if f.x[8] == SYS_WAIT => {
+                let Some(Cap::Recv(chan)) = with(|s| lookup(s, a).1) else {
+                    unreachable!("recv checked the capability");
+                };
+                // Back onto the `svc`: it runs again once woken.
+                f.elr -= 4;
+                return task::block_from_trap(f, chan as u64);
             }
-        }
+            Ok(None) => (f.x[0], f.x[1], f.x[2]) = (ERR_EMPTY, 0, 0),
+            Err(status) => (f.x[0], f.x[1], f.x[2]) = (status, 0, 0),
+        },
         _ => f.x[0] = ERR_CAP,
     }
     f

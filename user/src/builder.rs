@@ -426,7 +426,7 @@ pub fn run() -> ! {
     ui.say(format_args!("u6 circuit builder: type help, Enter"));
     loop {
         ui.draw_input();
-        let Some(key) = crate::wait(KEYS) else {
+        let Some(crate::Msg::Value(key)) = crate::wait(KEYS) else {
             ui.say(format_args!("no keyboard capability"));
             crate::exit(5);
         };

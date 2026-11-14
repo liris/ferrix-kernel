@@ -222,10 +222,10 @@ pub fn usb(rsdp: Option<acpi::Rsdp>) -> bool {
 /// run (and with them the circuit builder).
 pub fn user_programs() -> bool {
     match user::start() {
-        Ok((n, caps)) => {
+        Ok((n, caps, channels)) => {
             println!("[user] {} programs at EL0, {} KiB ELF", n, user::elf_size() >> 10);
             ok(format_args!("M7: user space, {} address spaces", n));
-            ok(format_args!("M8: {} capabilities, 2 channels", caps));
+            ok(format_args!("M8: {} capabilities, {} channels", caps, channels));
             ok("M9: circuit builder u6 has the keyboard");
             true
         }

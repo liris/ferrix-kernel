@@ -11,6 +11,11 @@
 //! of a channel, a small queue of 64-bit messages (send, or receive). The
 //! kernel feeds the keyboard into a channel too, so typed keys reach only
 //! the program holding its receiving end. Pure logic, no hardware access.
+//!
+//! A message is a value or a capability (M10b). Sending a capability moves
+//! it: it leaves the sender's table when it is queued, and lands in the
+//! first free slot of the receiver's table when it is received, so a
+//! program can pass on what it holds but never keep a copy.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -25,13 +30,27 @@ pub enum Cap {
     Recv(usize),
 }
 
+/// What a channel carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Msg {
+    Value(u64),
+    Cap(Cap),
+}
+
+/// Most capabilities one program can hold.
+pub const SLOTS: usize = 16;
+
 #[derive(Default)]
 pub struct CapTable {
     slots: Vec<Option<Cap>>,
 }
 
 impl CapTable {
+    /// # Panics
+    ///
+    /// If `caps` has more than `SLOTS` entries.
     pub fn new(caps: &[Cap]) -> Self {
+        assert!(caps.len() <= SLOTS, "more than {} capabilities", SLOTS);
         Self { slots: caps.iter().copied().map(Some).collect() }
     }
 
@@ -40,13 +59,33 @@ impl CapTable {
         self.slots.get(usize::try_from(n).ok()?).copied().flatten()
     }
 
+    /// Empties slot `n`, returning what it held.
+    pub fn take(&mut self, n: u64) -> Option<Cap> {
+        self.slots.get_mut(usize::try_from(n).ok()?)?.take()
+    }
+
+    /// Puts `cap` in the first free slot and returns its number; `None` if
+    /// all `SLOTS` are taken.
+    pub fn insert(&mut self, cap: Cap) -> Option<usize> {
+        let n = match self.slots.iter().position(Option::is_none) {
+            Some(n) => n,
+            None if self.slots.len() < SLOTS => {
+                self.slots.push(None);
+                self.slots.len() - 1
+            }
+            None => return None,
+        };
+        self.slots[n] = Some(cap);
+        Some(n)
+    }
+
     pub fn len(&self) -> usize {
         self.slots.iter().flatten().count()
     }
 }
 
 struct Queue {
-    messages: VecDeque<u64>,
+    messages: VecDeque<Msg>,
     depth: usize,
 }
 
@@ -63,18 +102,27 @@ impl Channels {
         self.queues.len() - 1
     }
 
-    /// Queues `value`; false if the channel is full.
-    pub fn send(&mut self, n: usize, value: u64) -> bool {
+    /// Queues `msg`; false if the channel is full.
+    pub fn send(&mut self, n: usize, msg: Msg) -> bool {
         let q = &mut self.queues[n];
         if q.messages.len() == q.depth {
             return false;
         }
-        q.messages.push_back(value);
+        q.messages.push_back(msg);
         true
     }
 
-    /// The oldest queued message, if any.
-    pub fn recv(&mut self, n: usize) -> Option<u64> {
+    /// The oldest queued message, left in the queue.
+    pub fn peek(&self, n: usize) -> Option<Msg> {
+        self.queues[n].messages.front().copied()
+    }
+
+    /// Takes the oldest queued message, if any.
+    pub fn recv(&mut self, n: usize) -> Option<Msg> {
         self.queues[n].messages.pop_front()
+    }
+
+    pub fn count(&self) -> usize {
+        self.queues.len()
     }
 }

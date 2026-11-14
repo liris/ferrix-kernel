@@ -10,6 +10,7 @@ heap, its own page tables, GICv3 timer interrupts, preemptive round-robin tasks,
 through its own xHCI driver, and user programs at EL0 in their own address spaces that can only use
 the capabilities they were given, one of them a circuit builder you type NAND circuits into. A program that ends is reclaimed
 (its stack, pages and ASID), and one is restarted every few seconds to show that nothing leaks.
+Capabilities can be handed over a channel: they move, so the sender loses what it gives.
 Alongside, a circuit simulator whose only primitive is NAND builds adders and a counter, which can
 be driven from the keyboard.
 
@@ -34,7 +35,7 @@ ferrix-kernel 0.1.0 (aarch64)
 [ ok ] M5: USB keyboard ready
 [user] 6 programs at EL0, 48 KiB ELF
 [ ok ] M7: user space, 6 address spaces
-[ ok ] M8: 9 capabilities, 2 channels
+[ ok ] M8: 12 capabilities, 3 channels
 [ ok ] M9: circuit builder u6 has the keyboard
 [lab ] counter 53 NAND, adder 36 NAND
 
@@ -44,8 +45,9 @@ add a=0011 b=0101 c=0 -> 01000 (3+5+0=8)
 cpu% spin 25 nand 25 fpu 25 u2 24
 spin 26309M  nand 1627404  fpu 125926k  sw 43357
 reaped 99  u5 x49  free 123081  asid 5
-u1 count n=2101 &n=0x400000003000
-u2 spin  n=19561M &n=0x400000003000
+u1 count n=2101 &n=0x40000000b000 s2 refused
+   u4 got it as slot 2
+u2 spin  n=19561M &n=0x40000000b000
 u3 sink  2101 msgs, last n=2101
 u4 forge 2024/2024 other slots denied
 u5 killed: read 0x9bdd5348 no permission
